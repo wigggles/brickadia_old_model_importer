@@ -1,0 +1,3 @@
+[submodule "submodules/bsp-converter-obj_textured"]
+	path = submodules/bsp-converter-obj_textured
+	url = git@github.com:kartjom/bsp-converter.git
