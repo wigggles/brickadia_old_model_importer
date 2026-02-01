@@ -11,6 +11,7 @@ mod palette;
 mod simplify;
 mod voxelize;
 
+use bsp_converter::{GameSource, is_bsp_file, detect_game_source};
 use brdb::{Brick, Color, Entity};
 use cgmath::Vector4;
 use eframe::{egui, egui::*, run_native, App, NativeOptions};
@@ -40,6 +41,21 @@ const WINDOW_WIDTH: f32 = 600.;
 const WINDOW_HEIGHT: f32 = 700.;
 
 const OBJ_ICON: &[u8; 10987] = include_bytes!("../res/obj_icon.png");
+
+/// The type of input file being processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputFileType {
+    /// Wavefront OBJ file (direct voxelization).
+    Obj,
+    /// BSP map file (requires conversion to OBJ first).
+    Bsp,
+}
+
+impl Default for InputFileType {
+    fn default() -> Self {
+        InputFileType::Obj
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Obj2Brs {
@@ -73,6 +89,17 @@ pub struct Obj2Brs {
     conversion_in_progress: bool,
     #[serde(skip)]
     conversion_done_receiver: Option<Receiver<()>>,
+
+    // BSP conversion options
+    /// Detected or selected input file type.
+    #[serde(default)]
+    input_file_type: InputFileType,
+    /// Selected game source for BSP conversion.
+    #[serde(default)]
+    bsp_game_source: GameSource,
+    /// Detected game source (for display, may differ from selected).
+    #[serde(skip)]
+    detected_game_source: Option<GameSource>,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
@@ -118,6 +145,10 @@ impl Default for Obj2Brs {
             logger: Logger::new(),
             conversion_in_progress: false,
             conversion_done_receiver: None,
+            // BSP options
+            input_file_type: InputFileType::Obj,
+            bsp_game_source: GameSource::Auto,
+            detected_game_source: None,
         }
     }
 }
@@ -214,13 +245,44 @@ impl App for Obj2Brs {
 }
 
 impl Obj2Brs {
+    /// Update detected file type and game source based on input path.
+    fn update_input_file_type(&mut self) {
+        let path = Path::new(&self.input_file_path);
+
+        if is_bsp_file(path) {
+            self.input_file_type = InputFileType::Bsp;
+
+            // Try to detect game source
+            if path.exists() {
+                match detect_game_source(path) {
+                    Ok(game) => {
+                        self.detected_game_source = Some(game);
+                        // Auto-select if user hasn't chosen
+                        if self.bsp_game_source == GameSource::Auto {
+                            self.bsp_game_source = game;
+                        }
+                    }
+                    Err(_) => {
+                        self.detected_game_source = None;
+                    }
+                }
+            } else {
+                self.detected_game_source = None;
+            }
+        } else {
+            self.input_file_type = InputFileType::Obj;
+            self.detected_game_source = None;
+        }
+    }
+
     fn receive_file_dialog_messages(&mut self) {
         if let Some(rx) = &self.input_file_path_receiver {
             if let Ok(data) = rx.try_recv() {
                 self.input_file_path_receiver = None;
                 if let Some(path) = data {
-                    if let Ok(path_str) = path.into_os_string().into_string() {
+                    if let Ok(path_str) = path.clone().into_os_string().into_string() {
                         self.input_file_path = path_str;
+                        self.update_input_file_type();
                     }
                 }
             }
@@ -249,7 +311,17 @@ impl Obj2Brs {
     fn paths(&mut self, ui: &mut Ui, input_file_valid: bool, output_dir_valid: bool) {
         let file_color = gui::bool_color(input_file_valid);
 
-        ui.label("OBJ File").on_hover_text("Model to convert");
+        // Dynamic label based on detected file type
+        let file_label = match self.input_file_type {
+            InputFileType::Obj => "OBJ File",
+            InputFileType::Bsp => "BSP File",
+        };
+        let file_tooltip = match self.input_file_type {
+            InputFileType::Obj => "Wavefront OBJ model to convert",
+            InputFileType::Bsp => "BSP map file (will be converted to OBJ first)",
+        };
+
+        ui.label(file_label).on_hover_text(file_tooltip);
         ui.horizontal(|ui| {
             ui.add(
                 TextEdit::singleline(&mut self.input_file_path)
@@ -260,12 +332,53 @@ impl Obj2Brs {
                 let (tx, rx) = mpsc::channel();
                 self.input_file_path_receiver = Some(rx);
                 thread::spawn(move || {
-                    let obj_path = FileDialog::new().add_filter("OBJ", &["obj"]).pick_file();
-                    let _ = tx.send(obj_path);
+                    let file_path = FileDialog::new()
+                        .add_filter("3D Models", &["obj", "bsp"])
+                        .add_filter("OBJ", &["obj"])
+                        .add_filter("BSP", &["bsp"])
+                        .pick_file();
+                    let _ = tx.send(file_path);
                 });
             }
         });
         ui.end_row();
+
+        // Show BSP-specific options when a BSP file is selected
+        if self.input_file_type == InputFileType::Bsp {
+            ui.label("Game Source").on_hover_text(
+                "Select the game this BSP file is from (auto-detected if possible)"
+            );
+            ui.horizontal(|ui| {
+                ComboBox::from_id_source("bsp_game_source")
+                    .selected_text(self.bsp_game_source.display_name())
+                    .show_ui(ui, |ui: &mut Ui| {
+                        ui.selectable_value(
+                            &mut self.bsp_game_source,
+                            GameSource::Auto,
+                            "Auto-detect"
+                        );
+                        ui.separator();
+                        for game in GameSource::all() {
+                            let label = if game.is_implemented() {
+                                game.display_name().to_string()
+                            } else {
+                                format!("{} (not implemented)", game.display_name())
+                            };
+                            ui.selectable_value(&mut self.bsp_game_source, *game, label);
+                        }
+                    });
+
+                // Show detected game source
+                if let Some(detected) = self.detected_game_source {
+                    ui.label(
+                        RichText::new(format!("(Detected: {})", detected.display_name()))
+                            .color(egui::Color32::LIGHT_GREEN)
+                            .small()
+                    );
+                }
+            });
+            ui.end_row();
+        }
 
         let dir_color = gui::bool_color(output_dir_valid);
 
@@ -274,7 +387,7 @@ impl Obj2Brs {
         ui.horizontal(|ui| {
             ui.add(
                 TextEdit::singleline(&mut self.output_directory)
-                    .desired_width(400.0)
+                    .desired_width(360.0)
                     .text_color(dir_color),
             );
             if gui::file_button(ui) && self.output_directory_receiver.is_none() {
@@ -289,6 +402,15 @@ impl Obj2Brs {
                     let output_dir = dialog.pick_folder();
                     let _ = tx.send(output_dir);
                 });
+            }
+            // Button to open output folder in file explorer
+            if output_dir_valid {
+                if ui.button("📂").on_hover_text("Open output folder in file explorer").clicked() {
+                    let output_path = self.output_directory.clone();
+                    thread::spawn(move || {
+                        let _ = open_folder_in_explorer(&output_path);
+                    });
+                }
             }
         });
         ui.end_row();
@@ -457,7 +579,13 @@ impl Obj2Brs {
     }
 
     fn do_conversion(&mut self) {
-        // Validate resources before conversion
+        // Handle BSP files: convert to OBJ first
+        if self.input_file_type == InputFileType::Bsp {
+            self.do_bsp_conversion();
+            return;
+        }
+
+        // OBJ file: validate resources before conversion
         let missing = match validate_obj_resources(&self.input_file_path) {
             Ok(m) => m,
             Err(e) => {
@@ -479,6 +607,132 @@ impl Obj2Brs {
 
         // No missing resources, continue with conversion
         self.continue_conversion(false);
+    }
+
+    fn do_bsp_conversion(&mut self) {
+        self.conversion_in_progress = true;
+        self.logger.log("Starting BSP to BRZ conversion...".to_string());
+
+        // Create channel to signal completion
+        let (tx, rx) = mpsc::channel();
+        self.conversion_done_receiver = Some(rx);
+
+        // Clone data needed for the background thread
+        let input_file_path = self.input_file_path.clone();
+        let output_directory = self.output_directory.clone();
+        let save_name = self.save_name.clone();
+        let save_owner_name = self.save_owner_name.clone();
+        let scale = self.scale;
+        let bricktype = self.bricktype;
+        let simplify = self.simplify;
+        let split_by_material = self.split_by_material;
+        let grid_offset_x = self.grid_offset_x;
+        let grid_offset_y = self.grid_offset_y;
+        let grid_offset_z = self.grid_offset_z;
+        let match_brickadia_colorset = self.match_brickadia_colorset;
+        let brick_scale = self.brick_scale;
+        let material = self.material;
+        let material_intensity = self.material_intensity;
+        let bsp_game_source = self.bsp_game_source;
+        let logger = self.logger.clone();
+
+        // Spawn background thread for BSP conversion
+        thread::spawn(move || {
+            // Step 1: Convert BSP to OBJ in a temp directory
+            logger.log(format!("Converting BSP using {} format...", bsp_game_source.display_name()));
+
+            // Create temp directory for OBJ output
+            let temp_dir = std::env::temp_dir().join("obj2brs_bsp_temp");
+            if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+                logger.log(format!("Error creating temp directory: {}", e));
+                let _ = tx.send(());
+                return;
+            }
+
+            // Convert BSP to OBJ
+            let bsp_result = bsp_converter::convert_bsp_to_obj_with_game(
+                &input_file_path,
+                &temp_dir,
+                bsp_game_source,
+            );
+
+            if let Err(e) = bsp_result {
+                logger.log(format!("BSP conversion error: {}", e));
+                MessageDialog::new()
+                    .set_level(MessageLevel::Error)
+                    .set_title("BSP Conversion Failed")
+                    .set_description(&format!("{}", e))
+                    .show();
+                let _ = tx.send(());
+                return;
+            }
+
+            logger.log("BSP converted to OBJ successfully".to_string());
+
+            // Find the generated OBJ file
+            let bsp_path = Path::new(&input_file_path);
+            let map_name = bsp_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("map");
+            let obj_path = temp_dir.join(format!("{}.obj", map_name));
+
+            if !obj_path.exists() {
+                logger.log("Error: Generated OBJ file not found".to_string());
+                let _ = tx.send(());
+                return;
+            }
+
+            let obj_path_str = obj_path.to_string_lossy().to_string();
+
+            // Step 2: Now convert OBJ to BRZ using the normal pipeline
+            logger.log("Converting OBJ to BRZ...".to_string());
+
+            let opts = Obj2Brs {
+                bricktype,
+                brick_scale,
+                input_file_path_receiver: None,
+                input_file_path: obj_path_str,
+                match_brickadia_colorset,
+                material,
+                material_intensity,
+                output_directory_receiver: None,
+                output_directory,
+                save_owner_id: "d66c4ad5-59fc-4a9b-80b8-08dedc25bff9".into(),
+                save_owner_name,
+                save_name,
+                scale,
+                simplify,
+                split_by_material,
+                grid_offset_x,
+                grid_offset_y,
+                grid_offset_z,
+                missing_resources_dialog: None,
+                pending_conversion_skip_textures: false,
+                logger: logger.clone(),
+                conversion_in_progress: true,
+                conversion_done_receiver: None,
+                input_file_type: InputFileType::Obj,
+                bsp_game_source: GameSource::Auto,
+                detected_game_source: None,
+            };
+
+            // Skip texture validation for BSP-converted OBJs (textures may not exist)
+            if let Err(e) = perform_conversion(&opts, true) {
+                logger.log(format!("Error: {}", e));
+                MessageDialog::new()
+                    .set_level(MessageLevel::Error)
+                    .set_title("Conversion Failed")
+                    .set_description(&format!("{}", e))
+                    .show();
+            }
+
+            // Cleanup temp directory (optional, leave for debugging)
+            // let _ = std::fs::remove_dir_all(&temp_dir);
+
+            // Signal completion
+            let _ = tx.send(());
+        });
     }
 
     fn continue_conversion(&mut self, skip_textures: bool) {
@@ -534,6 +788,10 @@ impl Obj2Brs {
                 logger: logger.clone(),
                 conversion_in_progress: true,
                 conversion_done_receiver: None,
+                // BSP fields (not used in OBJ conversion path)
+                input_file_type: InputFileType::Obj,
+                bsp_game_source: GameSource::Auto,
+                detected_game_source: None,
             };
 
             if let Err(e) = perform_conversion(&opts, skip_textures) {
@@ -549,6 +807,46 @@ impl Obj2Brs {
             let _ = tx.send(());
         });
     }
+}
+
+/// Opens a folder in the system file explorer.
+///
+/// Cross-platform function that opens the specified folder path in:
+/// - Windows: File Explorer
+/// - macOS: Finder
+/// - Linux: Default file manager
+fn open_folder_in_explorer(path: &str) -> std::io::Result<()> {
+    let path = Path::new(path);
+    
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Path does not exist",
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(path)
+            .spawn()?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()?;
+    }
+
+    Ok(())
 }
 
 /// Creates a 1x1 solid color texture from material color

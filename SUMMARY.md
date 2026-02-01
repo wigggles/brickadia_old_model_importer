@@ -6,7 +6,8 @@ This repository contains `obj2brs`, a Rust tool that converts a 3D model exporte
 
 This is an adaptation for Brickadia “a5” of Suficio’s `textured-voxelizer`.
 
-https://en.wikipedia.org/wiki/Wavefront_.obj_file
+pre compiled versions:
+https://github.com/Kmschr/obj2brs/releases
 
 ## What it outputs
 
@@ -74,7 +75,7 @@ The pipeline is:
 
 This repo is currently an **egui/eframe desktop app** (not a CLI-first tool):
 
-- Pick an input `.obj` file.
+- Pick an input `.obj` file. https://en.wikipedia.org/wiki/Wavefront_.obj_file
 - Pick an output directory.
 - Provide a save name.
 - Choose options (simplify, scale, brick type, material, etc.).

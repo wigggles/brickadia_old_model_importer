@@ -1,0 +1,23 @@
+[package]
+name = "bsp_converter"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-based BSP to OBJ converter for Brickadia obj2brs pipeline"
+authors = ["obj2brs contributors"]
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+# Safe transmute for packed binary structs
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Reading PK3 (ZIP) archives for texture extraction
+zip = "0.6"
+
+# Error handling
+thiserror = "1.0"
+
+# Serialization (optional, for GUI integration)
+serde = { version = "1.0", features = ["derive"], optional = true }

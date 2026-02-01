@@ -1,3 +1,6 @@
-[submodule "submodules/bsp-converter-obj_textured"]
-	path = submodules/bsp-converter-obj_textured
+[submodule "submodules/d3dbsp-converter-obj_textured"]
+	path = submodules/d3dbsp-converter-obj_textured
 	url = git@github.com:kartjom/bsp-converter.git
+[submodule "submodules/source_gold-converter-obj"]
+	path = submodules/source_gold-converter-obj
+	url = git@github.com:measuredweighed/BSP2OBJ.git
