@@ -485,23 +485,34 @@ impl Obj2Brs {
 
     fn options(&mut self, ui: &mut Ui, _uuid_valid: bool) {
         ui.label("Lossy Conversion").on_hover_text(
-            "Whether or not to merge similar bricks to create a less detailed model",
+            "Merges adjacent bricks of similar colors to reduce brick count.\n\n\
+            This significantly reduces file size but may lose fine detail.\n\
+            Recommended for large models. Can take 5-10 minutes for complex models.",
         );
         ui.add(Checkbox::new(&mut self.simplify, "Simplify (reduces brickcount)"));
         ui.end_row();
 
         ui.label("Scale")
-            .on_hover_text("Adjusts the overall size of the generated save");
+            .on_hover_text("Multiplier for the final build size in Brickadia.\n\n\
+            x1.0 = 1 unit in OBJ equals 1 Brickadia unit.\n\
+            x2.0 = Build will be twice as large.\n\
+            x0.5 = Build will be half the size.\n\
+            x0.125 = 1/8 scale (very small).\n\n\
+            Range: 0.01 to 100.0");
         ui.add(
             DragValue::new(&mut self.scale)
                 .min_decimals(2)
                 .prefix("x")
-                .speed(0.1),
+                .speed(0.01)
+                .range(0.01..=100.0),
         );
         ui.end_row();
 
         ui.label("Bricktype")
-            .on_hover_text("Which type of bricks will make up the generated save, use default to get a stud texture");
+            .on_hover_text("The brick type used to build the model:\n\n\
+            • Microbricks: Smallest bricks (2x2x2 studs). Best detail.\n\
+            • Default: Standard bricks with visible studs.\n\
+            • Tiles: Flat smooth bricks without studs.");
         ComboBox::from_label("")
             .selected_text(format!("{:?}", &mut self.bricktype))
             .show_ui(ui, |ui| {
@@ -511,7 +522,13 @@ impl Obj2Brs {
             });
         ui.end_row();
 
-        ui.label("Material");
+        ui.label("Material").on_hover_text("The Brickadia material applied to all bricks:\n\n\
+            • Plastic: Standard opaque material.\n\
+            • Glass: Transparent, see-through.\n\
+            • Glow: Emits light.\n\
+            • Metallic: Shiny reflective surface.\n\
+            • Hologram: Translucent with glow effect.\n\
+            • Ghost: Semi-transparent, no collision.");
         ComboBox::from_label("\n")
             .selected_text(format!("{:?}", &mut self.material))
             .show_ui(ui, |ui| {
@@ -526,7 +543,11 @@ impl Obj2Brs {
     }
 
     fn advanced_options(&mut self, ui: &mut Ui, uuid_valid: bool) {
-        ui.label("Material Intensity");
+        ui.label("Material Intensity").on_hover_text(
+            "Controls the strength of the Brickadia material effect (0-10).\n\n\
+            Higher values = stronger glow, more reflective metallic, etc.\n\
+            Only affects Glass, Glow, Metallic, Hologram, and Ghost materials.",
+        );
         ui.add(Slider::new(
             &mut self.material_intensity,
             RangeInclusive::new(0, 10),
@@ -534,13 +555,17 @@ impl Obj2Brs {
         ui.end_row();
 
         ui.label("Match to Colorset").on_hover_text(
-            "Modify the color of the model to match the default color palette in Brickadia",
+            "Snaps brick colors to Brickadia's default 64-color palette.\n\n\
+            Enable this if you want colors that match standard Brickadia bricks.\n\
+            Disable for more accurate color reproduction from the original model.",
         );
         ui.add(Checkbox::new(&mut self.match_brickadia_colorset, "Use Default Palette"));
         ui.end_row();
 
         ui.label("Split by Material (Experimental)").on_hover_text(
-            "Process each OBJ material separately into frozen grids",
+            "Creates separate frozen brick grids for each OBJ material.\n\n\
+            Useful for models with distinct parts you want to move independently.\n\
+            Each material becomes its own selectable group in Brickadia.",
         );
         ui.add(Checkbox::new(&mut self.split_by_material, "Separate grids per material"));
         ui.end_row();
@@ -567,7 +592,11 @@ impl Obj2Brs {
 
         if self.bricktype == BrickType::Microbricks {
             ui.label("Brick Scale")
-                .on_hover_text("Use this to make microbricks bigger for a more pixelated look");
+                .on_hover_text("Multiplies the size of each microbrick (1-500).\n\n\
+            x1 = Standard microbrick size (highest detail).\n\
+            x2 = Each voxel becomes 2x2x2 microbricks (blockier look).\n\
+            Higher values = more pixelated/chunky appearance.\n\n\
+            Note: This is different from 'Scale' which affects the overall build size.");
             ui.add(
                 DragValue::new(&mut self.brick_scale)
                     .prefix("x")
@@ -635,6 +664,35 @@ impl Obj2Brs {
                 .interactive(false));
             if ui.button("📂").on_hover_text("Open data folder").clicked() {
                 let path = data_path_str.clone();
+                thread::spawn(move || {
+                    let _ = open_folder_in_explorer(&path);
+                });
+            }
+        });
+
+        ui.add_space(5.);
+        ui.horizontal(|ui| {
+            ui.label("Brickadia Prefabs:");
+            let prefabs_path = match env::consts::OS {
+                "windows" => {
+                    dirs::data_local_dir()
+                        .map(|p| p.join("Brickadia\\Saved\\Prefabs"))
+                        .and_then(|p| p.to_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "Not found".to_string())
+                }
+                "linux" => {
+                    dirs::config_dir()
+                        .map(|p| p.join("Epic/Brickadia/Saved/Prefabs"))
+                        .and_then(|p| p.to_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "Not found".to_string())
+                }
+                _ => "Not supported".to_string(),
+            };
+            ui.add(TextEdit::singleline(&mut prefabs_path.clone())
+                .desired_width(350.0)
+                .interactive(false));
+            if ui.button("📂").on_hover_text("Open Brickadia Prefabs folder (paste .brz files here)").clicked() {
+                let path = prefabs_path.clone();
                 thread::spawn(move || {
                     let _ = open_folder_in_explorer(&path);
                 });
@@ -872,8 +930,8 @@ impl Obj2Brs {
                 detected_game_source: None,
             };
 
-            // Skip texture validation for BSP-converted OBJs (textures may not exist)
-            if let Err(e) = perform_conversion(&opts, true) {
+            // Load textures from BSP-converted OBJs (PNG textures exported from VTF files)
+            if let Err(e) = perform_conversion(&opts, false) {
                 logger.log(format!("Error: {}", e));
                 MessageDialog::new()
                     .set_level(MessageLevel::Error)
@@ -1454,11 +1512,11 @@ fn write_brz_data(octree: &mut octree::VoxelTree<Vector4<u8>>, opts: &Obj2Brs, m
         author_name: opts.save_owner_name.clone(),
     };
 
-    set_progress(opts, 60, "Simplifying...");
+    set_progress(opts, 60, "Simplifying... (this may take 5-10 minutes for complex models)");
     if let Some(id) = material_id {
-        opts.logger.log(format!("Simplifying material {}...", id));
+        opts.logger.log(format!("Simplifying material {}... (please wait, this can take several minutes)", id));
     } else {
-        opts.logger.log("Simplifying...".to_string());
+        opts.logger.log("Simplifying... (please wait, this can take 5-10 minutes for complex models)".to_string());
     }
 
     debug_log(&opts.logger, format!("Simplify mode: {}", if opts.simplify { "lossy" } else { "lossless" }));
