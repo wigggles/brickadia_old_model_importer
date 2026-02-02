@@ -16,6 +16,8 @@ Also supports `.bsp` files with plugins/bsp_converter.
 
 **See [`DATA_FOLDERS.md`](DATA_FOLDERS.md) for details on where imports, exports, and logs are stored.**
 
+Place the exported `.brz` file into your `%LocalAppData%\Brickadia\Saved\Prefabs` directory for in game use.
+
 ### Run (Windows / PowerShell)
 
 ```powershell
