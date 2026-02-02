@@ -17,8 +17,8 @@ const BUTTON_COLOR: Color32 = Color32::from_rgb(15, 98, 254);
 const ERROR_COLOR: Color32 = Color32::from_rgb(255, 168, 168);
 const FOLDER_COLOR: Color32 = Color32::from_rgb(255, 206, 70);
 
-pub fn add_grid(ui: &mut Ui, mut contents: impl FnMut(&mut Ui)) {
-    Grid::new("")
+pub fn add_grid(ui: &mut Ui, id: &str, mut contents: impl FnMut(&mut Ui)) {
+    Grid::new(id)
         .num_columns(2)
         .spacing([40.0, 4.0])
         .striped(true)

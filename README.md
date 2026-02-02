@@ -12,6 +12,10 @@ Generates textured voxel models from OBJ files.
 
 This project builds a desktop GUI app that converts `.obj` files into Brickadia `.brz` saves.
 
+Also supports `.bsp` files with plugins/bsp_converter.
+
+**See [`DATA_FOLDERS.md`](DATA_FOLDERS.md) for details on where imports, exports, and logs are stored.**
+
 ### Run (Windows / PowerShell)
 
 ```powershell
@@ -72,6 +76,7 @@ See `plugins/README.md` for build instructions and `plugins/bsp_converter/DESIGN
 
 - `SUMMARY.md`: overview of the conversion pipeline, options, and output behavior.
 - `BUILD.md`: multi-platform build notes.
+- `DATA_FOLDERS.md`: where imports, exports, and logs are stored for each run mode.
 - `SETUP_WINDOWS_RUST.md`: Windows 11 + Rust + PowerShell setup guide.
 - `plugins/README.md`: Rust-native converter plugins.
 

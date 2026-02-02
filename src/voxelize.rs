@@ -4,9 +4,10 @@ use crate::BrickType;
 use crate::intersect::intersect;
 use crate::octree::{Branches, TreeBody, VoxelTree};
 
-
 use cgmath::{Vector2, Vector3, Vector4};
 use image::RgbaImage;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
@@ -16,12 +17,42 @@ struct Triangle {
     uvs: Option<[Vector2<f32>; 3]>,
 }
 
+/// Progress tracker for voxelization
+pub struct VoxelizeProgress {
+    pub triangles_total: AtomicUsize,
+    pub triangles_processed: AtomicUsize,
+    pub depth_current: AtomicUsize,
+    pub depth_max: AtomicUsize,
+}
+
+impl VoxelizeProgress {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            triangles_total: AtomicUsize::new(0),
+            triangles_processed: AtomicUsize::new(0),
+            depth_current: AtomicUsize::new(0),
+            depth_max: AtomicUsize::new(0),
+        })
+    }
+}
+
 pub fn voxelize(
     models: &[tobj::Model],
     materials: &[RgbaImage],
     _scale: f32,
     _bricktype: BrickType,
     material_filter: Option<usize>,
+) -> VoxelTree<Vector4<u8>> {
+    voxelize_with_progress(models, materials, _scale, _bricktype, material_filter, None)
+}
+
+pub fn voxelize_with_progress(
+    models: &[tobj::Model],
+    materials: &[RgbaImage],
+    _scale: f32,
+    _bricktype: BrickType,
+    material_filter: Option<usize>,
+    progress: Option<Arc<VoxelizeProgress>>,
 ) -> VoxelTree<Vector4<u8>> {
     let mut octree = VoxelTree::<Vector4<u8>>::new();
 
@@ -114,7 +145,13 @@ pub fn voxelize(
         }
     }
 
-    recursive_voxelize(&mut octree.contents, mask, triangles, materials);
+    // Set up progress tracking
+    if let Some(ref p) = progress {
+        p.triangles_total.store(triangles.len(), Ordering::Relaxed);
+        p.depth_max.store(octree.size as usize, Ordering::Relaxed);
+    }
+
+    recursive_voxelize(&mut octree.contents, mask, triangles, materials, octree.size as usize, &progress);
 
     octree
 }
@@ -124,7 +161,13 @@ fn recursive_voxelize(
     mask: isize,
     vector: Vec<Triangle>,
     materials: &[RgbaImage],
+    depth: usize,
+    progress: &Option<Arc<VoxelizeProgress>>,
 ) {
+    // Update progress depth
+    if let Some(ref p) = progress {
+        p.depth_current.store(depth, Ordering::Relaxed);
+    }
     let m = mask >> 1;
     let half_box = (2 * m + ((m == 0) as isize)) as f32 / 2.;
 
@@ -185,10 +228,14 @@ fn recursive_voxelize(
                 // Not yet at root level, keep on recursing...
                 *branch = TreeBody::Branch(Box::new(TreeBody::empty()));
                 if let TreeBody::Branch(b) = branch {
-                    recursive_voxelize(b, m, triangles, materials);
+                    recursive_voxelize(b, m, triangles, materials, depth.saturating_sub(1), progress);
                 }
             } else {
                 *branch = TreeBody::Leaf(hsv2rgb(hsv_average(&colors)));
+                // Update progress when we complete a leaf (actual voxel)
+                if let Some(ref p) = progress {
+                    p.triangles_processed.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }

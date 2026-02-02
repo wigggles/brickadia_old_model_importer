@@ -27,7 +27,7 @@ use std::{
 };
 use tobj::LoadOptions;
 use uuid::Uuid;
-use voxelize::voxelize;
+use voxelize::{voxelize_with_progress, VoxelizeProgress};
 
 // Intermediate data structure for building the save
 #[derive(Clone)]
@@ -39,6 +39,10 @@ pub struct SaveData {
 
 const WINDOW_WIDTH: f32 = 600.;
 const WINDOW_HEIGHT: f32 = 700.;
+
+/// Enable verbose debug logging throughout the conversion pipeline.
+/// Set to `true` to see detailed information about each step.
+const DEBUG_MODE: bool = true;
 
 const OBJ_ICON: &[u8; 10987] = include_bytes!("../res/obj_icon.png");
 
@@ -89,6 +93,10 @@ pub struct Obj2Brs {
     conversion_in_progress: bool,
     #[serde(skip)]
     conversion_done_receiver: Option<Receiver<()>>,
+    #[serde(skip)]
+    conversion_progress: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    #[serde(skip)]
+    conversion_stage: std::sync::Arc<std::sync::Mutex<String>>,
 
     // BSP conversion options
     /// Detected or selected input file type.
@@ -121,19 +129,32 @@ pub enum Material {
 
 impl Default for Obj2Brs {
     fn default() -> Self {
+        // Get auto-suggested paths from data directory
+        let imports_dir = logger::get_imports_dir();
+        let exports_dir = logger::get_exports_dir();
+
+        // Use data/imports as default input path hint, data/exports as output
+        let default_input = if imports_dir.exists() {
+            imports_dir.to_string_lossy().to_string()
+        } else {
+            "".into()
+        };
+
+        let default_output = exports_dir.to_string_lossy().to_string();
+
         Self {
             bricktype: BrickType::Microbricks,
             brick_scale: 1,
             input_file_path_receiver: None,
-            input_file_path: "test.obj".into(),
+            input_file_path: default_input,
             match_brickadia_colorset: false,
             material: Material::Plastic,
             material_intensity: 5,
             output_directory_receiver: None,
-            output_directory: "builds".into(),
+            output_directory: default_output,
             save_owner_id: "d66c4ad5-59fc-4a9b-80b8-08dedc25bff9".into(),
             save_owner_name: "obj2brs".into(),
-            save_name: "test".into(),
+            save_name: "converted".into(),
             scale: 1.0,
             simplify: false,
             split_by_material: false,
@@ -145,6 +166,8 @@ impl Default for Obj2Brs {
             logger: Logger::new(),
             conversion_in_progress: false,
             conversion_done_receiver: None,
+            conversion_progress: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            conversion_stage: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             // BSP options
             input_file_type: InputFileType::Obj,
             bsp_game_source: GameSource::Auto,
@@ -172,52 +195,40 @@ impl App for Obj2Brs {
         // Show missing resources dialog if needed
         self.show_missing_resources_dialog(ctx);
 
-        CentralPanel::default().show(ctx, |ui: &mut Ui| {
-            ui.vertical(|ui| {
-                ScrollArea::vertical()
-                    .max_height(400.0)
-                    .show(ui, |ui| {
-                        gui::add_grid(ui, |ui| self.paths(ui, input_file_valid, output_dir_valid));
-                        gui::add_horizontal_line(ui);
-                        gui::add_grid(ui, |ui| self.options(ui, uuid_valid));
+        // Footer at very bottom (must be created first to be at bottom)
+        gui::footer(ctx);
 
-                        ui.add_space(5.);
-                        CollapsingHeader::new("Advanced Options")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                gui::add_grid(ui, |ui| self.advanced_options(ui, uuid_valid));
-                                ui.add_space(5.);
-                                gui::info_text(ui);
-                            });
-
-                        ui.add_space(10.);
-                        ui.horizontal(|ui| {
-                            let available_width = ui.available_width();
-                            ui.add_space((available_width - 60.0) / 2.0);
-                            let button_text = if self.conversion_in_progress {
-                                "Converting..."
-                            } else {
-                                "Voxelize"
-                            };
-                            if gui::button(ui, button_text, can_convert) {
-                                self.do_conversion()
-                            }
-                        });
-                        ui.add_space(10.);
+        // Log panel above footer - resizable
+        TopBottomPanel::bottom("log_panel")
+            .resizable(true)
+            .min_height(100.0)
+            .default_height(ctx.screen_rect().height() / 4.0)
+            .show(ctx, |ui| {
+                // Progress bar (shown during conversion)
+                if self.conversion_in_progress {
+                    let progress = self.conversion_progress.load(std::sync::atomic::Ordering::Relaxed) as f32 / 100.0;
+                    let stage = self.conversion_stage.lock().map(|s| s.clone()).unwrap_or_default();
+                    
+                    ui.horizontal(|ui| {
+                        ui.add(egui::ProgressBar::new(progress)
+                            .show_percentage()
+                            .animate(true));
                     });
-
-                // Log panel
-                ui.add_space(5.);
-                ui.separator();
-                ui.add_space(5.);
+                    if !stage.is_empty() {
+                        ui.label(RichText::new(&stage).color(egui::Color32::YELLOW).small());
+                    }
+                    ui.add_space(2.);
+                }
 
                 Frame::default()
                     .fill(egui::Color32::from_gray(20))
-                    .inner_margin(8.0)
+                    .inner_margin(egui::Margin { left: 8.0, right: 16.0, top: 8.0, bottom: 8.0 })
                     .show(ui, |ui| {
+                        ui.set_min_height(ui.available_height());
                         ScrollArea::vertical()
-                            .max_height(150.0)
                             .stick_to_bottom(true)
+                            .auto_shrink([false, false])
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                             .show(ui, |ui| {
                                 let messages = self.logger.get_messages();
                                 if messages.is_empty() {
@@ -239,7 +250,45 @@ impl App for Obj2Brs {
                     });
             });
 
-            gui::footer(ctx);
+        // Main content area
+        CentralPanel::default().show(ctx, |ui: &mut Ui| {
+            ScrollArea::vertical().show(ui, |ui| {
+                gui::add_grid(ui, "paths_grid", |ui| self.paths(ui, input_file_valid, output_dir_valid));
+                gui::add_horizontal_line(ui);
+                gui::add_grid(ui, "options_grid", |ui| self.options(ui, uuid_valid));
+
+                ui.add_space(5.);
+                CollapsingHeader::new("Advanced Options")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        gui::add_grid(ui, "advanced_options_grid", |ui| self.advanced_options(ui, uuid_valid));
+                        ui.add_space(5.);
+                        gui::info_text(ui);
+                    });
+
+                ui.add_space(5.);
+                CollapsingHeader::new("Cache & Data")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        self.cache_options(ui);
+                    });
+
+                ui.add_space(10.);
+                ui.horizontal(|ui| {
+                    let available_width = ui.available_width();
+                    ui.add_space((available_width - 60.0) / 2.0);
+                    let button_text = if self.conversion_in_progress {
+                        "Converting..."
+                    } else {
+                        "Voxelize"
+                    };
+                    if gui::button(ui, button_text, can_convert) {
+                        self.do_conversion()
+                    }
+                });
+                ui.add_space(10.);
+            });
+
         });
     }
 }
@@ -529,6 +578,57 @@ impl Obj2Brs {
         ui.end_row();
     }
 
+    fn cache_options(&mut self, ui: &mut Ui) {
+        let cache_dir = logger::get_cache_dir();
+        let cache_path_str = cache_dir.to_string_lossy().to_string();
+
+        ui.horizontal(|ui| {
+            ui.label("User Cache Location:");
+            ui.add(TextEdit::singleline(&mut cache_path_str.clone())
+                .desired_width(350.0)
+                .interactive(false));
+            if ui.button("📂").on_hover_text("Open cache folder").clicked() {
+                let path = cache_path_str.clone();
+                thread::spawn(move || {
+                    let _ = open_folder_in_explorer(&path);
+                });
+            }
+        });
+
+        ui.add_space(5.);
+        ui.horizontal(|ui| {
+            ui.label("Cache contains: app settings, window size, logs");
+        });
+
+        ui.add_space(5.);
+        ui.horizontal(|ui| {
+            if ui.button("🗑 Clear Cache").on_hover_text("Delete all cached data (settings will reset on next launch)").clicked() {
+                if let Err(e) = logger::flush_cache() {
+                    self.logger.log(format!("Failed to clear cache: {}", e));
+                } else {
+                    self.logger.log("Cache cleared. Settings will reset on next launch.".to_string());
+                }
+            }
+            ui.label(RichText::new("(Requires restart to take effect)").small().color(egui::Color32::GRAY));
+        });
+
+        ui.add_space(5.);
+        let data_dir = logger::get_data_dir();
+        ui.horizontal(|ui| {
+            ui.label("Data Directory:");
+            let data_path_str = data_dir.to_string_lossy().to_string();
+            ui.add(TextEdit::singleline(&mut data_path_str.clone())
+                .desired_width(350.0)
+                .interactive(false));
+            if ui.button("📂").on_hover_text("Open data folder").clicked() {
+                let path = data_path_str.clone();
+                thread::spawn(move || {
+                    let _ = open_folder_in_explorer(&path);
+                });
+            }
+        });
+    }
+
     fn show_missing_resources_dialog(&mut self, ctx: &egui::Context) {
         if let Some(message) = &self.missing_resources_dialog.clone() {
             let mut open = true;
@@ -611,6 +711,10 @@ impl Obj2Brs {
 
     fn do_bsp_conversion(&mut self) {
         self.conversion_in_progress = true;
+        self.conversion_progress.store(0, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut stage) = self.conversion_stage.lock() {
+            *stage = "Starting BSP conversion...".to_string();
+        }
         self.logger.log("Starting BSP to BRZ conversion...".to_string());
 
         // Create channel to signal completion
@@ -635,10 +739,21 @@ impl Obj2Brs {
         let material_intensity = self.material_intensity;
         let bsp_game_source = self.bsp_game_source;
         let logger = self.logger.clone();
+        let progress = self.conversion_progress.clone();
+        let stage = self.conversion_stage.clone();
 
         // Spawn background thread for BSP conversion
         thread::spawn(move || {
+            // Helper to set progress
+            let set_prog = |p: u32, s: &str| {
+                progress.store(p, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut st) = stage.lock() {
+                    *st = s.to_string();
+                }
+            };
+
             // Step 1: Convert BSP to OBJ in a temp directory
+            set_prog(5, &format!("Converting BSP ({})...", bsp_game_source.display_name()));
             logger.log(format!("Converting BSP using {} format...", bsp_game_source.display_name()));
 
             // Create temp directory for OBJ output
@@ -667,6 +782,7 @@ impl Obj2Brs {
                 return;
             }
 
+            set_prog(20, "BSP converted, loading OBJ...");
             logger.log("BSP converted to OBJ successfully".to_string());
 
             // Find the generated OBJ file
@@ -686,6 +802,7 @@ impl Obj2Brs {
             let obj_path_str = obj_path.to_string_lossy().to_string();
 
             // Step 2: Now convert OBJ to BRZ using the normal pipeline
+            set_prog(25, "Converting OBJ to BRZ...");
             logger.log("Converting OBJ to BRZ...".to_string());
 
             let opts = Obj2Brs {
@@ -712,6 +829,8 @@ impl Obj2Brs {
                 logger: logger.clone(),
                 conversion_in_progress: true,
                 conversion_done_receiver: None,
+                conversion_progress: progress.clone(),
+                conversion_stage: stage.clone(),
                 input_file_type: InputFileType::Obj,
                 bsp_game_source: GameSource::Auto,
                 detected_game_source: None,
@@ -731,12 +850,17 @@ impl Obj2Brs {
             // let _ = std::fs::remove_dir_all(&temp_dir);
 
             // Signal completion
+            set_prog(100, "Complete!");
             let _ = tx.send(());
         });
     }
 
     fn continue_conversion(&mut self, skip_textures: bool) {
         self.conversion_in_progress = true;
+        self.conversion_progress.store(0, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut stage) = self.conversion_stage.lock() {
+            *stage = "Initializing...".to_string();
+        }
         self.logger.log("Starting conversion...".to_string());
 
         // Create channel to signal completion
@@ -760,6 +884,8 @@ impl Obj2Brs {
         let material = self.material;
         let material_intensity = self.material_intensity;
         let logger = self.logger.clone();
+        let progress = self.conversion_progress.clone();
+        let stage = self.conversion_stage.clone();
 
         // Spawn background thread for conversion
         thread::spawn(move || {
@@ -788,6 +914,8 @@ impl Obj2Brs {
                 logger: logger.clone(),
                 conversion_in_progress: true,
                 conversion_done_receiver: None,
+                conversion_progress: progress.clone(),
+                conversion_stage: stage.clone(),
                 // BSP fields (not used in OBJ conversion path)
                 input_file_type: InputFileType::Obj,
                 bsp_game_source: GameSource::Auto,
@@ -804,6 +932,7 @@ impl Obj2Brs {
             }
 
             // Signal completion
+            progress.store(100, std::sync::atomic::Ordering::Relaxed);
             let _ = tx.send(());
         });
     }
@@ -913,16 +1042,33 @@ fn validate_obj_resources(obj_path: &str) -> ConversionResult<MissingResources> 
     Ok(missing)
 }
 
+fn set_progress(opts: &Obj2Brs, percent: u32, stage: &str) {
+    opts.conversion_progress.store(percent, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut s) = opts.conversion_stage.lock() {
+        *s = stage.to_string();
+    }
+}
+
+/// Log a debug message only when DEBUG_MODE is enabled
+fn debug_log(logger: &Logger, message: String) {
+    if DEBUG_MODE {
+        logger.log(format!("[DEBUG] {}", message));
+    }
+}
+
 fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<()> {
     if opts.split_by_material {
         // Load models and materials once
+        set_progress(opts, 5, "Loading models and materials...");
         opts.logger.log("Loading models and materials...".to_string());
         let (mut models, material_images) = load_models_and_materials(opts, skip_textures)?;
         let material_count = material_images.len();
 
         if material_count == 0 {
             opts.logger.log("No materials found, falling back to single grid".to_string());
+            set_progress(opts, 20, "Voxelizing...");
             let mut octree = voxelize_models(&mut models, &material_images, opts, None);
+            set_progress(opts, 70, "Writing BRZ file...");
             return write_brz_data(&mut octree, opts, None);
         }
 
@@ -932,6 +1078,8 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
         let mut material_grids: Vec<(Entity, Vec<Brick>)> = Vec::new();
 
         for mat_id in 0..material_count {
+            let base_progress = 10 + (mat_id * 80 / material_count) as u32;
+            set_progress(opts, base_progress, &format!("Processing material {} of {}", mat_id + 1, material_count));
             opts.logger.log(format!("Processing material {} of {}", mat_id + 1, material_count));
 
             // Voxelize only this material
@@ -944,6 +1092,7 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
                 author_name: opts.save_owner_name.clone(),
             };
 
+            set_progress(opts, base_progress + 5, &format!("Simplifying material {}...", mat_id + 1));
             opts.logger.log(format!("Simplifying material {}...", mat_id));
             if opts.simplify {
                 simplify_lossy(&mut octree, &mut save_data, opts, max_merge);
@@ -972,10 +1121,13 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
             }
         }
 
+        set_progress(opts, 90, "Writing BRZ file...");
         write_brz_with_grids(opts, material_grids)
     } else {
         // Regular single-grid conversion
+        set_progress(opts, 10, "Loading model...");
         let mut octree = generate_octree(opts, skip_textures, None)?;
+        set_progress(opts, 50, "Simplifying and generating bricks...");
         write_brz_data(&mut octree, opts, None)
     }
 }
@@ -987,6 +1139,9 @@ fn load_models_and_materials(
     let p = Path::new(&opt.input_file_path);
 
     opt.logger.log("Importing model...".to_string());
+    debug_log(&opt.logger, format!("Input file: {:?}", p));
+    debug_log(&opt.logger, format!("Skip textures: {}", skip_textures));
+    
     let load_options = LoadOptions {
         triangulate: true,
         ignore_lines: true,
@@ -995,6 +1150,15 @@ fn load_models_and_materials(
     };
     let (mut models, materials) = tobj::load_obj(&opt.input_file_path, &load_options)
         .map_err(|e| ConversionError::ObjParseError(e.to_string()))?;
+
+    // Debug: Log model statistics
+    debug_log(&opt.logger, format!("Loaded {} model(s)", models.len()));
+    for (i, model) in models.iter().enumerate() {
+        let vertex_count = model.mesh.positions.len() / 3;
+        let face_count = model.mesh.indices.len() / 3;
+        debug_log(&opt.logger, format!("  Model {}: '{}' - {} vertices, {} faces", 
+            i, model.name, vertex_count, face_count));
+    }
 
     opt.logger.log("Loading materials...".to_string());
     let mut material_images = Vec::<image::RgbaImage>::new();
@@ -1116,7 +1280,54 @@ fn voxelize_models(
     } else {
         opts.logger.log("Voxelizing...".to_string());
     }
-    voxelize(models, material_images, opts.scale, opts.bricktype, material_filter)
+    
+    debug_log(&opts.logger, format!("Scale: {}, Brick type: {:?}", opts.scale, opts.bricktype));
+    debug_log(&opts.logger, format!("Material filter: {:?}", material_filter));
+    debug_log(&opts.logger, format!("Material images count: {}", material_images.len()));
+    
+    // Create progress tracker
+    let progress = VoxelizeProgress::new();
+    let progress_clone = progress.clone();
+    let logger_clone = opts.logger.clone();
+    
+    // Heartbeat thread to report progress every 5 seconds
+    let heartbeat_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let heartbeat_flag = heartbeat_running.clone();
+    let heartbeat_handle = thread::spawn(move || {
+        let mut last_processed = 0usize;
+        let start_time = std::time::Instant::now();
+        while heartbeat_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            thread::sleep(std::time::Duration::from_secs(5));
+            if !heartbeat_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let processed = progress_clone.triangles_processed.load(std::sync::atomic::Ordering::Relaxed);
+            let total = progress_clone.triangles_total.load(std::sync::atomic::Ordering::Relaxed);
+            let depth = progress_clone.depth_current.load(std::sync::atomic::Ordering::Relaxed);
+            let max_depth = progress_clone.depth_max.load(std::sync::atomic::Ordering::Relaxed);
+            let elapsed = start_time.elapsed();
+            let rate = if elapsed.as_secs() > 0 { processed / elapsed.as_secs() as usize } else { 0 };
+            let delta = processed - last_processed;
+            last_processed = processed;
+            logger_clone.log(format!(
+                "  [Voxelizing] {} voxels created (+{}/5s, ~{}/s), depth {}/{}, elapsed {:.0?}",
+                processed, delta, rate, max_depth.saturating_sub(depth), max_depth, elapsed
+            ));
+        }
+    });
+    
+    let start = std::time::Instant::now();
+    let result = voxelize_with_progress(models, material_images, opts.scale, opts.bricktype, material_filter, Some(progress.clone()));
+    let elapsed = start.elapsed();
+    
+    // Stop heartbeat thread
+    heartbeat_running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = heartbeat_handle.join();
+    
+    let final_voxels = progress.triangles_processed.load(std::sync::atomic::Ordering::Relaxed);
+    opts.logger.log(format!("Voxelization completed: {} voxels in {:.2?}", final_voxels, elapsed));
+    
+    result
 }
 
 fn generate_octree(opt: &Obj2Brs, skip_textures: bool, material_filter: Option<usize>) -> ConversionResult<octree::VoxelTree<Vector4<u8>>> {
@@ -1134,19 +1345,30 @@ fn write_brz_data(octree: &mut octree::VoxelTree<Vector4<u8>>, opts: &Obj2Brs, m
         author_name: opts.save_owner_name.clone(),
     };
 
+    set_progress(opts, 60, "Simplifying...");
     if let Some(id) = material_id {
         opts.logger.log(format!("Simplifying material {}...", id));
     } else {
         opts.logger.log("Simplifying...".to_string());
     }
 
+    debug_log(&opts.logger, format!("Simplify mode: {}", if opts.simplify { "lossy" } else { "lossless" }));
+    debug_log(&opts.logger, format!("Max merge: {}", max_merge));
+    
+    let start = std::time::Instant::now();
     if opts.simplify {
         simplify_lossy(octree, &mut save_data, opts, max_merge);
     } else {
         simplify_lossless(octree, &mut save_data, opts, max_merge);
     }
+    let elapsed = start.elapsed();
+    
+    debug_log(&opts.logger, format!("Simplification completed in {:.2?}", elapsed));
+    debug_log(&opts.logger, format!("Generated {} bricks", save_data.bricks.len()));
+    debug_log(&opts.logger, format!("Using {} colors", save_data.colors.len()));
 
     // Write file
+    set_progress(opts, 85, &format!("Writing {} bricks...", save_data.bricks.len()));
     opts.logger.log(format!("Writing {} bricks...", save_data.bricks.len()));
 
     let preview = image::load_from_memory_with_format(OBJ_ICON, image::ImageFormat::Png)
@@ -1206,6 +1428,12 @@ fn main() {
     let logger = Logger::new();
     logger.log("obj2brs started - ready to convert OBJ files to Brickadia saves".to_string());
 
+    // Log the data directory location
+    let data_dir = logger::get_data_dir();
+    let cache_dir = logger::get_cache_dir();
+    logger.log(format!("Data directory: {:?}", data_dir));
+    logger.log(format!("User cache: {:?}", cache_dir));
+
     let build_dir = match env::consts::OS {
         "windows" => {
             dirs::data_local_dir()
@@ -1223,15 +1451,21 @@ fn main() {
     };
 
     let build_dir_clone = build_dir.clone();
+    
+    // Use our custom cache directory for eframe persistence
+    let persistence_path = logger::get_cache_dir().join("app_state");
+    
     let win_option = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
-            .with_resizable(false)
+            .with_min_inner_size([500.0, 400.0])
+            .with_resizable(true)
             .with_icon(egui::IconData {
                 rgba: icon::ICON.to_vec(),
                 width: 32,
                 height: 32,
             }),
+        persistence_path: Some(persistence_path),
         ..Default::default()
     };
     let _ = run_native(
@@ -1261,6 +1495,8 @@ fn main() {
             app.conversion_done_receiver = None;
             app.missing_resources_dialog = None;
             app.pending_conversion_skip_textures = false;
+            app.conversion_progress = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            app.conversion_stage = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
             Ok(Box::new(app))
         }),

@@ -21,3 +21,6 @@ Cargo.lock
 # IntelliJ
 .idea/
 *.iml
+
+# Data directory used for caches and model imports/exports
+data/
