@@ -22,7 +22,7 @@ pub fn write_brz(
         world.meta.bundle.name = stem.to_string_lossy().to_string();
     }
     world.meta.bundle.authors = vec![data.author_name.clone()];
-    world.meta.bundle.description = "Converted with obj2brs".to_string();
+    world.meta.bundle.description = "Converted with obj2brz".to_string();
 
     // Copy bricks directly - they're already in brdb format
     world.bricks = data.bricks.clone();
@@ -59,7 +59,7 @@ pub fn write_brz_grids(
         world.meta.bundle.name = stem.to_string_lossy().to_string();
     }
     world.meta.bundle.authors = vec![opts.save_owner_name.clone()];
-    world.meta.bundle.description = "Converted with obj2brs (split by material)".to_string();
+    world.meta.bundle.description = "Converted with obj2brz (split by material)".to_string();
 
     // Add each material's bricks as a separate frozen grid
     let total_bricks: usize = grids.iter().map(|(_, bricks)| bricks.len()).sum();

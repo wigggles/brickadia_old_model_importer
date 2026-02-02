@@ -1,4 +1,4 @@
-# Launch script for obj2brs GUI (PowerShell)
+# Launch script for obj2brz GUI (PowerShell)
 # Runs the application from source code in DEBUG mode for faster iteration
 #
 # Usage:
@@ -10,7 +10,7 @@ param(
 )
 
 Write-Host "===================================" -ForegroundColor Cyan
-Write-Host "Launching obj2brs GUI..." -ForegroundColor Cyan
+Write-Host "Launching obj2brz GUI..." -ForegroundColor Cyan
 Write-Host "===================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -33,5 +33,5 @@ if ($Release) {
 
 Write-Host ""
 Write-Host "===================================" -ForegroundColor Cyan
-Write-Host "obj2brs GUI closed" -ForegroundColor Cyan
+Write-Host "obj2brz GUI closed" -ForegroundColor Cyan
 Write-Host "===================================" -ForegroundColor Cyan

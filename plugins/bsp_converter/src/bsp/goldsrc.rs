@@ -23,7 +23,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use crate::binary::{bytes_to_string, read_struct, read_struct_array, seek_to};
@@ -375,23 +375,8 @@ pub fn parse<P: AsRef<Path>>(path: P, palette: Option<&[u8]>) -> BspResult<BspDa
     // Build material name list
     let materials: Vec<String> = textures.iter().map(|t| t.name.clone()).collect();
 
-    // Convert vertices with swizzle
-    let vertices: Vec<Vertex> = raw_vertices
-        .iter()
-        .map(|v| {
-            let (x, y, z) = v.swizzled();
-            Vertex {
-                position: [x, y, z],
-                // UVs will be computed per-face during triangulation
-                uv: [0.0, 0.0],
-                // Normals will be computed per-face
-                normal: [0.0, 0.0, 1.0],
-            }
-        })
-        .collect();
-
-    // Triangulate faces and compute UVs
-    let faces = triangulate_faces(
+    // Build vertices and faces with proper normals and UVs
+    let (vertices, faces) = build_geometry(
         &raw_faces,
         &edges,
         &surfedges,
@@ -519,23 +504,28 @@ fn parse_textures<R: Read + Seek>(
     Ok(textures)
 }
 
-/// Triangulate GoldSrc faces (edge-based polygons) into triangle indices.
+/// Build geometry with proper per-face vertices, normals, and UVs.
 ///
-/// GoldSrc faces are defined by edges, not direct vertex indices.
+/// GoldSrc BSP stores vertices globally, but we need per-face vertices
+/// to have correct normals (since the same vertex can have different
+/// normals depending on which face it belongs to).
+///
 /// This function:
-/// 1. Resolves surfedges to get vertex indices for each face
-/// 2. Computes UVs from texinfo
-/// 3. Triangulates polygons using fan triangulation
-/// 4. Computes face normals
-fn triangulate_faces(
+/// 1. Resolves surfedges to get vertex positions for each face
+/// 2. Computes face normal from cross product
+/// 3. Computes UVs from texinfo axes
+/// 4. Creates new vertices for each face with correct normals/UVs
+/// 5. Triangulates polygons using fan triangulation
+fn build_geometry(
     raw_faces: &[GoldSrcFace],
     edges: &[GoldSrcEdge],
     surfedges: &[SurfEdge],
-    vertices: &[GoldSrcVertex],
+    raw_vertices: &[GoldSrcVertex],
     texinfos: &[GoldSrcTexInfo],
     textures: &[GoldSrcTexture],
-) -> Vec<Face> {
-    let mut faces = Vec::with_capacity(raw_faces.len());
+) -> (Vec<Vertex>, Vec<Face>) {
+    let mut vertices = Vec::new();
+    let mut faces = Vec::new();
 
     for raw_face in raw_faces {
         // Get texinfo for this face
@@ -545,21 +535,43 @@ fn triangulate_faces(
         }
         let texinfo = &texinfos[texinfo_idx];
 
-        // Get texture for UV calculation
+        // Get texture for UV calculation and filtering
         let tex_idx = texinfo.texture_id as usize;
-        let (tex_width, tex_height) = if tex_idx < textures.len() {
-            (textures[tex_idx].width as f32, textures[tex_idx].height as f32)
+        let (tex_name, tex_width, tex_height) = if tex_idx < textures.len() {
+            (
+                textures[tex_idx].name.as_str(),
+                textures[tex_idx].width as f32,
+                textures[tex_idx].height as f32,
+            )
         } else {
-            (64.0, 64.0) // Default size
+            ("", 64.0, 64.0) // Default size
         };
+
+        // Skip special textures that shouldn't be rendered
+        // - sky: skybox faces (large room walls)
+        // - trigger: invisible trigger volumes
+        // - clip: invisible collision brushes
+        // - aaatrigger: another trigger type
+        // - origin: origin brushes
+        // - null: null/invisible faces
+        let tex_lower = tex_name.to_lowercase();
+        if tex_lower.starts_with("sky")
+            || tex_lower.contains("trigger")
+            || tex_lower.starts_with("clip")
+            || tex_lower.starts_with("origin")
+            || tex_lower == "null"
+            || tex_lower.starts_with("aaatrigger")
+        {
+            continue;
+        }
 
         // Skip degenerate textures
         if tex_width == 0.0 || tex_height == 0.0 {
             continue;
         }
 
-        // Resolve edge list to vertex indices
-        let mut vert_indices = Vec::with_capacity(raw_face.num_edges as usize);
+        // Resolve edge list to vertex positions
+        let mut face_verts: Vec<&GoldSrcVertex> = Vec::with_capacity(raw_face.num_edges as usize);
 
         for i in 0..raw_face.num_edges as usize {
             let surfedge_idx = raw_face.first_edge as usize + i;
@@ -577,29 +589,83 @@ fn triangulate_faces(
             let edge = &edges[edge_idx];
 
             // Surfedge sign determines edge direction
-            let vert_idx = if surfedge >= 0 {
-                edge.v2 as usize // Forward: use second vertex
+            // Negative: use first vertex (vert1)
+            // Positive: use second vertex (vert2)
+            let vert_idx = if surfedge < 0 {
+                edge.v1 as usize
             } else {
-                edge.v1 as usize // Reverse: use first vertex
+                edge.v2 as usize
             };
 
-            vert_indices.push(vert_idx);
+            if vert_idx < raw_vertices.len() {
+                face_verts.push(&raw_vertices[vert_idx]);
+            }
         }
 
         // Need at least 3 vertices to form a triangle
-        if vert_indices.len() < 3 {
+        if face_verts.len() < 3 {
             continue;
+        }
+
+        // Compute face normal from first 3 vertices (cross product)
+        let v0 = face_verts[0];
+        let v1 = face_verts[1];
+        let v2 = face_verts[2];
+
+        // Get swizzled positions
+        let (p0x, p0y, p0z) = v0.swizzled();
+        let (p1x, p1y, p1z) = v1.swizzled();
+        let (p2x, p2y, p2z) = v2.swizzled();
+
+        // Edge vectors
+        let e1 = (p1x - p0x, p1y - p0y, p1z - p0z);
+        let e2 = (p2x - p0x, p2y - p0y, p2z - p0z);
+
+        // Cross product for normal
+        let nx = e1.1 * e2.2 - e1.2 * e2.1;
+        let ny = e1.2 * e2.0 - e1.0 * e2.2;
+        let nz = e1.0 * e2.1 - e1.1 * e2.0;
+
+        // Normalize
+        let len = (nx * nx + ny * ny + nz * nz).sqrt();
+        let normal = if len > 0.0001 {
+            [nx / len, ny / len, nz / len]
+        } else {
+            [0.0, 0.0, 1.0] // Fallback for degenerate faces
+        };
+
+        // Create vertices for this face with proper normals and UVs
+        let base_vertex_idx = vertices.len();
+
+        for vert in &face_verts {
+            let (x, y, z) = vert.swizzled();
+
+            // Compute UV from texinfo
+            // The UV axes need to be swizzled the same way as vertices
+            // Then we dot the swizzled vertex with the swizzled axis
+            let u_axis_swizzled = [texinfo.u_axis[0], texinfo.u_axis[2], -texinfo.u_axis[1]];
+            let v_axis_swizzled = [texinfo.v_axis[0], texinfo.v_axis[2], -texinfo.v_axis[1]];
+            
+            // Dot product with swizzled vertex position
+            let u = (x * u_axis_swizzled[0] + y * u_axis_swizzled[1] + z * u_axis_swizzled[2] + texinfo.u_offset) / tex_width;
+            let v = (x * v_axis_swizzled[0] + y * v_axis_swizzled[1] + z * v_axis_swizzled[2] + texinfo.v_offset) / tex_height;
+
+            vertices.push(Vertex {
+                position: [x, y, z],
+                uv: [u, v],
+                normal,
+            });
         }
 
         // Triangulate using fan from first vertex
         // For N vertices, we get N-2 triangles
-        let mut indices = Vec::with_capacity((vert_indices.len() - 2) * 3);
+        let mut indices = Vec::with_capacity((face_verts.len() - 2) * 3);
 
-        for i in 1..vert_indices.len() - 1 {
+        for i in 1..face_verts.len() - 1 {
             // Triangle: v0, vi, vi+1
-            indices.push(vert_indices[0]);
-            indices.push(vert_indices[i]);
-            indices.push(vert_indices[i + 1]);
+            indices.push(base_vertex_idx);
+            indices.push(base_vertex_idx + i);
+            indices.push(base_vertex_idx + i + 1);
         }
 
         faces.push(Face {
@@ -608,7 +674,7 @@ fn triangulate_faces(
         });
     }
 
-    faces
+    (vertices, faces)
 }
 
 // =============================================================================

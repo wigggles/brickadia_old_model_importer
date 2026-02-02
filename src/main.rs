@@ -97,6 +97,8 @@ pub struct Obj2Brs {
     conversion_progress: std::sync::Arc<std::sync::atomic::AtomicU32>,
     #[serde(skip)]
     conversion_stage: std::sync::Arc<std::sync::Mutex<String>>,
+    #[serde(skip)]
+    conversion_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     // BSP conversion options
     /// Detected or selected input file type.
@@ -153,7 +155,7 @@ impl Default for Obj2Brs {
             output_directory_receiver: None,
             output_directory: default_output,
             save_owner_id: "d66c4ad5-59fc-4a9b-80b8-08dedc25bff9".into(),
-            save_owner_name: "obj2brs".into(),
+            save_owner_name: "obj2brz".into(),
             save_name: "converted".into(),
             scale: 1.0,
             simplify: false,
@@ -168,6 +170,7 @@ impl Default for Obj2Brs {
             conversion_done_receiver: None,
             conversion_progress: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             conversion_stage: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            conversion_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // BSP options
             input_file_type: InputFileType::Obj,
             bsp_game_source: GameSource::Auto,
@@ -213,6 +216,10 @@ impl App for Obj2Brs {
                         ui.add(egui::ProgressBar::new(progress)
                             .show_percentage()
                             .animate(true));
+                        if ui.button("Cancel").clicked() {
+                            self.conversion_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.logger.log("Cancellation requested...".to_string());
+                        }
                     });
                     if !stage.is_empty() {
                         ui.label(RichText::new(&stage).color(egui::Color32::YELLOW).small());
@@ -712,6 +719,7 @@ impl Obj2Brs {
     fn do_bsp_conversion(&mut self) {
         self.conversion_in_progress = true;
         self.conversion_progress.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.conversion_cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut stage) = self.conversion_stage.lock() {
             *stage = "Starting BSP conversion...".to_string();
         }
@@ -741,6 +749,7 @@ impl Obj2Brs {
         let logger = self.logger.clone();
         let progress = self.conversion_progress.clone();
         let stage = self.conversion_stage.clone();
+        let cancelled = self.conversion_cancelled.clone();
 
         // Spawn background thread for BSP conversion
         thread::spawn(move || {
@@ -757,11 +766,20 @@ impl Obj2Brs {
             logger.log(format!("Converting BSP using {} format...", bsp_game_source.display_name()));
 
             // Create temp directory for OBJ output
-            let temp_dir = std::env::temp_dir().join("obj2brs_bsp_temp");
+            // In debug mode, use data/exports/bsp_temp for easier inspection
+            // In release mode, use system temp directory
+            let temp_dir = if DEBUG_MODE {
+                logger::get_exports_dir().join("bsp_temp")
+            } else {
+                std::env::temp_dir().join("obj2brz_bsp_temp")
+            };
             if let Err(e) = std::fs::create_dir_all(&temp_dir) {
                 logger.log(format!("Error creating temp directory: {}", e));
                 let _ = tx.send(());
                 return;
+            }
+            if DEBUG_MODE {
+                logger.log(format!("[DEBUG] BSP temp directory: {:?}", temp_dir));
             }
 
             // Convert BSP to OBJ
@@ -831,6 +849,7 @@ impl Obj2Brs {
                 conversion_done_receiver: None,
                 conversion_progress: progress.clone(),
                 conversion_stage: stage.clone(),
+                conversion_cancelled: cancelled.clone(),
                 input_file_type: InputFileType::Obj,
                 bsp_game_source: GameSource::Auto,
                 detected_game_source: None,
@@ -858,6 +877,7 @@ impl Obj2Brs {
     fn continue_conversion(&mut self, skip_textures: bool) {
         self.conversion_in_progress = true;
         self.conversion_progress.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.conversion_cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut stage) = self.conversion_stage.lock() {
             *stage = "Initializing...".to_string();
         }
@@ -886,6 +906,7 @@ impl Obj2Brs {
         let logger = self.logger.clone();
         let progress = self.conversion_progress.clone();
         let stage = self.conversion_stage.clone();
+        let cancelled = self.conversion_cancelled.clone();
 
         // Spawn background thread for conversion
         thread::spawn(move || {
@@ -916,6 +937,7 @@ impl Obj2Brs {
                 conversion_done_receiver: None,
                 conversion_progress: progress.clone(),
                 conversion_stage: stage.clone(),
+                conversion_cancelled: cancelled.clone(),
                 // BSP fields (not used in OBJ conversion path)
                 input_file_type: InputFileType::Obj,
                 bsp_game_source: GameSource::Auto,
@@ -1049,6 +1071,11 @@ fn set_progress(opts: &Obj2Brs, percent: u32, stage: &str) {
     }
 }
 
+/// Check if the conversion has been cancelled
+fn is_cancelled(opts: &Obj2Brs) -> bool {
+    opts.conversion_cancelled.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Log a debug message only when DEBUG_MODE is enabled
 fn debug_log(logger: &Logger, message: String) {
     if DEBUG_MODE {
@@ -1056,7 +1083,25 @@ fn debug_log(logger: &Logger, message: String) {
     }
 }
 
+/// Format a number with comma separators for readability (e.g., 1234567 -> "1,234,567")
+fn format_number(n: usize) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
 fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<()> {
+    if is_cancelled(opts) {
+        opts.logger.log("Conversion cancelled.".to_string());
+        return Ok(());
+    }
+    
     if opts.split_by_material {
         // Load models and materials once
         set_progress(opts, 5, "Loading models and materials...");
@@ -1078,6 +1123,11 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
         let mut material_grids: Vec<(Entity, Vec<Brick>)> = Vec::new();
 
         for mat_id in 0..material_count {
+            if is_cancelled(opts) {
+                opts.logger.log("Conversion cancelled.".to_string());
+                return Ok(());
+            }
+            
             let base_progress = 10 + (mat_id * 80 / material_count) as u32;
             set_progress(opts, base_progress, &format!("Processing material {} of {}", mat_id + 1, material_count));
             opts.logger.log(format!("Processing material {} of {}", mat_id + 1, material_count));
@@ -1127,6 +1177,12 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
         // Regular single-grid conversion
         set_progress(opts, 10, "Loading model...");
         let mut octree = generate_octree(opts, skip_textures, None)?;
+        
+        if is_cancelled(opts) {
+            opts.logger.log("Conversion cancelled.".to_string());
+            return Ok(());
+        }
+        
         set_progress(opts, 50, "Simplifying and generating bricks...");
         write_brz_data(&mut octree, opts, None)
     }
@@ -1275,10 +1331,22 @@ fn voxelize_models(
     opts: &Obj2Brs,
     material_filter: Option<usize>,
 ) -> octree::VoxelTree<Vector4<u8>> {
+    // Calculate model statistics for progress estimation
+    let total_models = models.len();
+    let mut total_vertices = 0usize;
+    let mut total_faces = 0usize;
+    for m in models.iter() {
+        total_vertices += m.mesh.positions.len() / 3;
+        total_faces += m.mesh.indices.len() / 3;
+    }
+    
     if let Some(filter_id) = material_filter {
         opts.logger.log(format!("Voxelizing material {}...", filter_id));
     } else {
-        opts.logger.log("Voxelizing...".to_string());
+        opts.logger.log(format!(
+            "Voxelizing {} models ({} vertices, {} faces)...",
+            total_models, total_vertices, total_faces
+        ));
     }
     
     debug_log(&opts.logger, format!("Scale: {}, Brick type: {:?}", opts.scale, opts.bricktype));
@@ -1295,6 +1363,7 @@ fn voxelize_models(
     let heartbeat_flag = heartbeat_running.clone();
     let heartbeat_handle = thread::spawn(move || {
         let mut last_processed = 0usize;
+        let mut last_rate_samples: Vec<usize> = Vec::with_capacity(6); // Keep last 30s of rates
         let start_time = std::time::Instant::now();
         while heartbeat_flag.load(std::sync::atomic::Ordering::Relaxed) {
             thread::sleep(std::time::Duration::from_secs(5));
@@ -1302,16 +1371,36 @@ fn voxelize_models(
                 break;
             }
             let processed = progress_clone.triangles_processed.load(std::sync::atomic::Ordering::Relaxed);
-            let total = progress_clone.triangles_total.load(std::sync::atomic::Ordering::Relaxed);
+            let _total = progress_clone.triangles_total.load(std::sync::atomic::Ordering::Relaxed);
             let depth = progress_clone.depth_current.load(std::sync::atomic::Ordering::Relaxed);
             let max_depth = progress_clone.depth_max.load(std::sync::atomic::Ordering::Relaxed);
             let elapsed = start_time.elapsed();
-            let rate = if elapsed.as_secs() > 0 { processed / elapsed.as_secs() as usize } else { 0 };
-            let delta = processed - last_processed;
+            
+            let delta = processed.saturating_sub(last_processed);
             last_processed = processed;
+            
+            // Track rate samples for smoothed estimation
+            let current_rate = delta / 5; // per second
+            if last_rate_samples.len() >= 6 {
+                last_rate_samples.remove(0);
+            }
+            last_rate_samples.push(current_rate);
+            
+            // Calculate smoothed average rate
+            let avg_rate = if !last_rate_samples.is_empty() {
+                last_rate_samples.iter().sum::<usize>() / last_rate_samples.len()
+            } else {
+                current_rate
+            };
+            
+            // Format large numbers with commas for readability
+            let processed_fmt = format_number(processed);
+            let delta_fmt = format_number(delta);
+            let rate_fmt = format_number(avg_rate);
+            
             logger_clone.log(format!(
-                "  [Voxelizing] {} voxels created (+{}/5s, ~{}/s), depth {}/{}, elapsed {:.0?}",
-                processed, delta, rate, max_depth.saturating_sub(depth), max_depth, elapsed
+                "  [Voxelizing] {} voxels (+{}/5s, ~{}/s), depth {}/{}, elapsed {:.0?}",
+                processed_fmt, delta_fmt, rate_fmt, max_depth.saturating_sub(depth), max_depth, elapsed
             ));
         }
     });
@@ -1325,7 +1414,10 @@ fn voxelize_models(
     let _ = heartbeat_handle.join();
     
     let final_voxels = progress.triangles_processed.load(std::sync::atomic::Ordering::Relaxed);
-    opts.logger.log(format!("Voxelization completed: {} voxels in {:.2?}", final_voxels, elapsed));
+    let voxels_fmt = format_number(final_voxels);
+    let rate = if elapsed.as_secs() > 0 { final_voxels / elapsed.as_secs() as usize } else { final_voxels };
+    let rate_fmt = format_number(rate);
+    opts.logger.log(format!("Voxelization completed: {} voxels in {:.2?} (~{}/s avg)", voxels_fmt, elapsed, rate_fmt));
     
     result
 }
@@ -1426,7 +1518,7 @@ fn write_brz_with_grids(opts: &Obj2Brs, grids: Vec<(Entity, Vec<Brick>)>) -> Con
 
 fn main() {
     let logger = Logger::new();
-    logger.log("obj2brs started - ready to convert OBJ files to Brickadia saves".to_string());
+    logger.log("obj2brz started - ready to convert OBJ files to Brickadia saves".to_string());
 
     // Log the data directory location
     let data_dir = logger::get_data_dir();
@@ -1469,7 +1561,7 @@ fn main() {
         ..Default::default()
     };
     let _ = run_native(
-        "obj2brs",
+        "obj2brz",
         win_option,
         Box::new(move |cc| {
             // Load previous state if available
@@ -1497,6 +1589,7 @@ fn main() {
             app.pending_conversion_skip_textures = false;
             app.conversion_progress = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             app.conversion_stage = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            app.conversion_cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             Ok(Box::new(app))
         }),

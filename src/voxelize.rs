@@ -6,8 +6,54 @@ use crate::octree::{Branches, TreeBody, VoxelTree};
 
 use cgmath::{Vector2, Vector3, Vector4};
 use image::RgbaImage;
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Axis-Aligned Bounding Box for fast rejection tests
+#[derive(Debug, Copy, Clone)]
+struct AABB {
+    min: Vector3<f32>,
+    max: Vector3<f32>,
+}
+
+impl AABB {
+    /// Create AABB from triangle vertices
+    fn from_triangle(v0: Vector3<f32>, v1: Vector3<f32>, v2: Vector3<f32>) -> Self {
+        Self {
+            min: Vector3::new(
+                v0.x.min(v1.x).min(v2.x),
+                v0.y.min(v1.y).min(v2.y),
+                v0.z.min(v1.z).min(v2.z),
+            ),
+            max: Vector3::new(
+                v0.x.max(v1.x).max(v2.x),
+                v0.y.max(v1.y).max(v2.y),
+                v0.z.max(v1.z).max(v2.z),
+            ),
+        }
+    }
+
+    /// Fast test: does this AABB intersect a cube centered at `center` with half-extent `half_box`?
+    #[inline(always)]
+    fn intersects_cube(&self, center: Vector3<f32>, half_box: f32) -> bool {
+        // Check if AABB overlaps with the cube on all three axes
+        let cube_min = center - Vector3::new(half_box, half_box, half_box);
+        let cube_max = center + Vector3::new(half_box, half_box, half_box);
+        
+        self.max.x >= cube_min.x && self.min.x <= cube_max.x &&
+        self.max.y >= cube_min.y && self.min.y <= cube_max.y &&
+        self.max.z >= cube_min.z && self.min.z <= cube_max.z
+    }
+
+    /// Translate the AABB by subtracting an offset (for recursive subdivision)
+    fn translated(&self, offset: Vector3<f32>) -> Self {
+        Self {
+            min: self.min - offset,
+            max: self.max - offset,
+        }
+    }
+}
 
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
@@ -15,6 +61,8 @@ struct Triangle {
     material_id: Option<usize>,
     vertices: [Vector3<f32>; 3],
     uvs: Option<[Vector2<f32>; 3]>,
+    /// Pre-computed bounding box for fast rejection
+    aabb: AABB,
 }
 
 /// Progress tracker for voxelization
@@ -36,6 +84,7 @@ impl VoxelizeProgress {
     }
 }
 
+#[allow(dead_code)]
 pub fn voxelize(
     models: &[tobj::Model],
     materials: &[RgbaImage],
@@ -135,10 +184,12 @@ pub fn voxelize_with_progress(
                 None
             };
 
+            let aabb = AABB::from_triangle(v0, v1, v2);
             let triangle = Triangle {
                 material_id: material,
                 vertices: [v0, v1, v2],
                 uvs,
+                aabb,
             };
 
             triangles.push(triangle);
@@ -156,6 +207,10 @@ pub fn voxelize_with_progress(
     octree
 }
 
+/// Minimum depth at which to use parallel processing.
+/// Below this depth, the overhead of spawning tasks outweighs the benefits.
+const PARALLEL_DEPTH_THRESHOLD: usize = 3;
+
 fn recursive_voxelize(
     branches: &mut Branches<Vector4<u8>>,
     mask: isize,
@@ -171,70 +226,131 @@ fn recursive_voxelize(
     let m = mask >> 1;
     let half_box = (2 * m + ((m == 0) as isize)) as f32 / 2.;
 
-    for (i, branch) in branches.iter_mut().enumerate() {
-        if let TreeBody::Empty = branch {
-            let center = Vector3::<f32>::new(
-                half_box * (2 * ((i & 4) > 0) as isize - 1) as f32,
-                half_box * (2 * ((i & 2) > 0) as isize - 1) as f32,
-                half_box * (2 * ((i & 1) > 0) as isize - 1) as f32,
-            );
+    // Use parallel processing for higher depths where there's enough work
+    if depth >= PARALLEL_DEPTH_THRESHOLD && m != 0 {
+        // Compute results in parallel, then assign back
+        let results: Vec<(usize, TreeBody<Vector4<u8>>)> = (0..8usize)
+            .into_par_iter()
+            .filter_map(|i| {
+                // Check if this branch is empty (we only process empty branches)
+                let center = Vector3::<f32>::new(
+                    half_box * (2 * ((i & 4) > 0) as isize - 1) as f32,
+                    half_box * (2 * ((i & 2) > 0) as isize - 1) as f32,
+                    half_box * (2 * ((i & 1) > 0) as isize - 1) as f32,
+                );
 
-            let mut triangles = Vec::<Triangle>::new();
-            let mut colors = Vec::<Vector4<u8>>::new();
+                let mut triangles = Vec::<Triangle>::new();
 
-            for triangle in &vector {
-                match intersect(
-                    half_box,
-                    center,
-                    triangle.vertices[0],
-                    triangle.vertices[1],
-                    triangle.vertices[2],
-                ) {
-                    Some(intersection) => {
-                        // Only calculate colors if in root level
-                        if m == 0 {
-                            if let Some(id) = triangle.material_id {
-                                let uv =
-                                    interpolate_uv(&triangle.vertices, &triangle.uvs, intersection);
-                                let m = &materials[id];
+                for triangle in &vector {
+                    // Fast AABB rejection test first
+                    if !triangle.aabb.intersects_cube(center, half_box) {
+                        continue;
+                    }
+                    // Full SAT intersection test
+                    if intersect(
+                        half_box,
+                        center,
+                        triangle.vertices[0],
+                        triangle.vertices[1],
+                        triangle.vertices[2],
+                    ).is_some() {
+                        let mut cloned_triangle = *triangle;
+                        cloned_triangle.vertices[0] -= center;
+                        cloned_triangle.vertices[1] -= center;
+                        cloned_triangle.vertices[2] -= center;
+                        cloned_triangle.aabb = triangle.aabb.translated(center);
+                        triangles.push(cloned_triangle);
+                    }
+                }
 
-                                let u = ((uv[0] - uv[0].floor()) * (m.width() - 1) as f32) as u32;
-                                let v =
-                                    ((1. - uv[1] + uv[1].floor()) * (m.height() - 1) as f32) as u32;
+                if triangles.is_empty() {
+                    return None;
+                }
 
-                                let c = *m.get_pixel(u, v);
-                                if c[3] == 0 {
-                                    continue;
-                                } // If alpha is zero, skeedaddle
-                                colors.push(Vector4::<u8>::new(c[0], c[1], c[2], c[3]));
+                // Recursively build this branch
+                let mut sub_branches = TreeBody::empty();
+                recursive_voxelize(&mut sub_branches, m, triangles, materials, depth.saturating_sub(1), progress);
+                Some((i, TreeBody::Branch(Box::new(sub_branches))))
+            })
+            .collect();
+
+        // Assign results back to branches
+        for (i, body) in results {
+            branches[i] = body;
+        }
+    } else {
+        // Sequential processing for lower depths or leaf level
+        for (i, branch) in branches.iter_mut().enumerate() {
+            if let TreeBody::Empty = branch {
+                let center = Vector3::<f32>::new(
+                    half_box * (2 * ((i & 4) > 0) as isize - 1) as f32,
+                    half_box * (2 * ((i & 2) > 0) as isize - 1) as f32,
+                    half_box * (2 * ((i & 1) > 0) as isize - 1) as f32,
+                );
+
+                let mut triangles = Vec::<Triangle>::new();
+                let mut colors = Vec::<Vector4<u8>>::new();
+
+                for triangle in &vector {
+                    // Fast AABB rejection test first
+                    if !triangle.aabb.intersects_cube(center, half_box) {
+                        continue;
+                    }
+                    // Full SAT intersection test
+                    match intersect(
+                        half_box,
+                        center,
+                        triangle.vertices[0],
+                        triangle.vertices[1],
+                        triangle.vertices[2],
+                    ) {
+                        Some(intersection) => {
+                            // Only calculate colors if in root level
+                            if m == 0 {
+                                if let Some(id) = triangle.material_id {
+                                    let uv =
+                                        interpolate_uv(&triangle.vertices, &triangle.uvs, intersection);
+                                    let mat = &materials[id];
+
+                                    let u = ((uv[0] - uv[0].floor()) * (mat.width() - 1) as f32) as u32;
+                                    let v =
+                                        ((1. - uv[1] + uv[1].floor()) * (mat.height() - 1) as f32) as u32;
+
+                                    let c = *mat.get_pixel(u, v);
+                                    if c[3] == 0 {
+                                        continue;
+                                    } // If alpha is zero, skeedaddle
+                                    colors.push(Vector4::<u8>::new(c[0], c[1], c[2], c[3]));
+                                }
                             }
                         }
+                        None => continue,
                     }
-                    None => continue,
+
+                    let mut cloned_triangle = *triangle;
+                    cloned_triangle.vertices[0] -= center;
+                    cloned_triangle.vertices[1] -= center;
+                    cloned_triangle.vertices[2] -= center;
+                    cloned_triangle.aabb = triangle.aabb.translated(center);
+
+                    triangles.push(cloned_triangle);
                 }
 
-                let mut cloned_triangle = *triangle;
-                cloned_triangle.vertices[0] -= center;
-                cloned_triangle.vertices[1] -= center;
-                cloned_triangle.vertices[2] -= center;
-
-                triangles.push(cloned_triangle);
-            }
-
-            if triangles.is_empty() {
-                continue;
-            }
-            if m != 0 {
-                // Not yet at root level, keep on recursing...
-                *branch = TreeBody::Branch(Box::new(TreeBody::empty()));
-                if let TreeBody::Branch(b) = branch {
-                    recursive_voxelize(b, m, triangles, materials, depth.saturating_sub(1), progress);
+                if triangles.is_empty() {
+                    continue;
                 }
-            } else {
-                *branch = TreeBody::Leaf(hsv2rgb(hsv_average(&colors)));
-                // Update progress when we complete a leaf (actual voxel)
-                if let Some(ref p) = progress {
-                    p.triangles_processed.fetch_add(1, Ordering::Relaxed);
+                if m != 0 {
+                    // Not yet at root level, keep on recursing...
+                    *branch = TreeBody::Branch(Box::new(TreeBody::empty()));
+                    if let TreeBody::Branch(b) = branch {
+                        recursive_voxelize(b, m, triangles, materials, depth.saturating_sub(1), progress);
+                    }
+                } else {
+                    *branch = TreeBody::Leaf(hsv2rgb(hsv_average(&colors)));
+                    // Update progress when we complete a leaf (actual voxel)
+                    if let Some(ref p) = progress {
+                        p.triangles_processed.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }

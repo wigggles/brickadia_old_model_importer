@@ -25,7 +25,7 @@
 //!
 //! **PLACEHOLDER** — Basic structure defined, full implementation TODO.
 
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 
 use bytemuck::{Pod, Zeroable};

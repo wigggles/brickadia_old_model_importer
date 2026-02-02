@@ -100,7 +100,7 @@ impl Logger {
         }
 
         let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-        let log_path = logs_dir.join(format!("obj2brs_{}.log", timestamp));
+        let log_path = logs_dir.join(format!("obj2brz_{}.log", timestamp));
 
         OpenOptions::new()
             .create(true)
@@ -134,6 +134,7 @@ impl Logger {
     }
 
     /// Get the path to the current log file
+    #[allow(dead_code)]
     pub fn get_log_path(&self) -> Option<PathBuf> {
         let logs_dir = get_logs_dir();
         if logs_dir.exists() {

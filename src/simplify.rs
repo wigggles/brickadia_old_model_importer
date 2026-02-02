@@ -1,9 +1,9 @@
 use crate::color::*;
-use crate::octree::{TreeBody, VoxelTree};
+use crate::octree::{Branches, TreeBody, VoxelTree};
 use crate::{BrickType, Obj2Brs, SaveData};
 
 use brdb::{Brick, BrickSize, BrickType as BrdbBrickType, Color, Direction, Position, Rotation};
-use cgmath::{Vector3, Vector4};
+use cgmath::Vector4;
 
 // Enum to represent brick colors (index or unique)
 #[derive(Debug, Clone, Copy)]
@@ -12,12 +12,125 @@ pub enum BrickColor {
     Unique(Color),
 }
 
+/// A flat 3D grid for O(1) voxel access during simplification.
+/// This replaces the O(log n) octree traversal with direct array indexing.
+struct VoxelGrid {
+    /// Flat array of voxels, indexed as [x + y * size + z * size * size]
+    data: Vec<Option<Vector4<u8>>>,
+    /// Size of the grid in each dimension (grid is size x size x size)
+    size: usize,
+    /// Offset to convert from octree coordinates (which can be negative) to grid indices
+    offset: isize,
+}
+
+impl VoxelGrid {
+    /// Convert octree to flat grid. The octree spans from -2^size to 2^size in each dimension.
+    fn from_octree(octree: &VoxelTree<Vector4<u8>>) -> Self {
+        let half_size = 1isize << octree.size;
+        let size = (half_size * 2) as usize;
+        let offset = half_size; // Add this to convert octree coord to grid index
+        
+        let mut data = vec![None; size * size * size];
+        
+        // Recursively extract all leaves from octree
+        Self::extract_leaves(&octree.contents, half_size, -half_size, -half_size, -half_size, &mut data, size, offset);
+        
+        Self { data, size, offset }
+    }
+    
+    fn extract_leaves(
+        branches: &Branches<Vector4<u8>>,
+        mask: isize,
+        base_x: isize,
+        base_y: isize,
+        base_z: isize,
+        data: &mut Vec<Option<Vector4<u8>>>,
+        size: usize,
+        offset: isize,
+    ) {
+        let m = mask >> 1;
+        let step = 2 * m + ((m == 0) as isize);
+        
+        for (i, branch) in branches.iter().enumerate() {
+            let x = base_x + step * ((i & 4) > 0) as isize;
+            let y = base_y + step * ((i & 2) > 0) as isize;
+            let z = base_z + step * ((i & 1) > 0) as isize;
+            
+            match branch {
+                TreeBody::Branch(b) => {
+                    if m > 0 {
+                        Self::extract_leaves(b, m, x, y, z, data, size, offset);
+                    }
+                }
+                TreeBody::Leaf(color) => {
+                    if m == 0 {
+                        let idx = Self::coord_to_index_static(x, y, z, size, offset);
+                        if idx < data.len() {
+                            data[idx] = Some(*color);
+                        }
+                    }
+                }
+                TreeBody::Empty => {}
+            }
+        }
+    }
+    
+    #[inline(always)]
+    fn coord_to_index_static(x: isize, y: isize, z: isize, size: usize, offset: isize) -> usize {
+        let gx = (x + offset) as usize;
+        let gy = (y + offset) as usize;
+        let gz = (z + offset) as usize;
+        gx + gy * size + gz * size * size
+    }
+    
+    #[inline(always)]
+    fn coord_to_index(&self, x: isize, y: isize, z: isize) -> usize {
+        Self::coord_to_index_static(x, y, z, self.size, self.offset)
+    }
+    
+    #[inline(always)]
+    fn get(&self, x: isize, y: isize, z: isize) -> Option<Vector4<u8>> {
+        let idx = self.coord_to_index(x, y, z);
+        if idx < self.data.len() {
+            self.data[idx]
+        } else {
+            None
+        }
+    }
+    
+    #[inline(always)]
+    fn clear(&mut self, x: isize, y: isize, z: isize) {
+        let idx = self.coord_to_index(x, y, z);
+        if idx < self.data.len() {
+            self.data[idx] = None;
+        }
+    }
+    
+    /// Find the next non-empty voxel starting from the given position.
+    /// Returns None if no more voxels exist.
+    fn find_next_voxel(&self, start_idx: usize) -> Option<(usize, isize, isize, isize, Vector4<u8>)> {
+        for idx in start_idx..self.data.len() {
+            if let Some(color) = self.data[idx] {
+                let size = self.size;
+                let x = (idx % size) as isize - self.offset;
+                let y = ((idx / size) % size) as isize - self.offset;
+                let z = (idx / (size * size)) as isize - self.offset;
+                return Some((idx, x, y, z, color));
+            }
+        }
+        None
+    }
+}
+
 pub fn simplify_lossy(
     octree: &mut VoxelTree<Vector4<u8>>,
     save_data: &mut SaveData,
     opts: &Obj2Brs,
     max_merge: isize,
 ) {
+    // Convert octree to flat grid for O(1) access
+    let mut grid = VoxelGrid::from_octree(octree);
+    
     let colorset = convert_colorset_to_hsv(&save_data.colors);
     let scales: (isize, isize, isize) = if opts.bricktype == BrickType::Microbricks {
         (opts.brick_scale, opts.brick_scale, opts.brick_scale)
@@ -27,92 +140,80 @@ pub fn simplify_lossy(
 
     let max_scale = isize::max(isize::max(scales.0, scales.1), scales.2);
     let max_merge = max_merge / max_scale;
+    let grid_len = grid.size as isize;
 
-    loop {
-        let mut colors = Vec::<Vector4<u8>>::new();
-        let (x, y, z);
-        {
-            let (location, voxel) = octree.get_any_mut_or_create();
-
-            x = location[0];
-            y = location[1];
-            z = location[2];
-
-            match voxel {
-                TreeBody::Leaf(leaf_color) => {
-                    colors.push(*leaf_color);
-                }
-                _ => break,
-            }
-        }
+    let mut search_idx = 0usize;
+    
+    while let Some((idx, x, y, z, first_color)) = grid.find_next_voxel(search_idx) {
+        search_idx = idx; // Start next search from here
+        
+        let mut colors = vec![first_color];
 
         let mut xp = x + 1;
         let mut yp = y + 1;
         let mut zp = z + 1;
 
-        // Expand z direction first due to octree ordering followed by y and x
-        // Ensures blocks are simplified in the pattern of Morton coding
-        // Saves us having to check in the negative directions
-        while zp - z < max_merge {
-            let voxel = octree.get_mut_or_create(Vector3::new(x, y, zp));
-            match voxel {
-                TreeBody::Leaf(leaf_color) => {
-                    colors.push(*leaf_color);
-                    zp += 1
-                }
-                _ => break,
-            }
-        }
-
-        while yp - y < max_merge {
-            let mut pass = true;
-            for sz in z..zp {
-                let voxel = octree.get_mut_or_create(Vector3::new(x, yp, sz));
-                match voxel {
-                    TreeBody::Leaf(leaf_color) => colors.push(*leaf_color),
-                    _ => {
-                        pass = false;
-                        break;
-                    }
-                }
-            }
-            if !pass {
+        // Expand z direction first
+        while zp - z < max_merge && zp < grid_len {
+            if let Some(color) = grid.get(x, y, zp) {
+                colors.push(color);
+                zp += 1;
+            } else {
                 break;
             }
-            yp += 1;
         }
 
-        while xp - x < max_merge {
+        // Expand y direction
+        while yp - y < max_merge && yp < grid_len {
             let mut pass = true;
-            for sy in y..yp {
-                for sz in z..zp {
-                    let voxel = octree.get_mut_or_create(Vector3::new(xp, sy, sz));
-                    match voxel {
-                        TreeBody::Leaf(leaf_color) => colors.push(*leaf_color),
-                        _ => {
-                            pass = false;
-                            break;
-                        }
-                    }
-                }
-                if !pass {
+            for sz in z..zp {
+                if grid.get(x, yp, sz).is_none() {
+                    pass = false;
                     break;
                 }
             }
             if !pass {
                 break;
             }
+            // Collect colors
+            for sz in z..zp {
+                if let Some(color) = grid.get(x, yp, sz) {
+                    colors.push(color);
+                }
+            }
+            yp += 1;
+        }
+
+        // Expand x direction
+        while xp - x < max_merge && xp < grid_len {
+            let mut pass = true;
+            'outer: for sy in y..yp {
+                for sz in z..zp {
+                    if grid.get(xp, sy, sz).is_none() {
+                        pass = false;
+                        break 'outer;
+                    }
+                }
+            }
+            if !pass {
+                break;
+            }
+            // Collect colors
+            for sy in y..yp {
+                for sz in z..zp {
+                    if let Some(color) = grid.get(xp, sy, sz) {
+                        colors.push(color);
+                    }
+                }
+            }
             xp += 1;
         }
 
-        // Clear nodes
-        // This cant be done during the loops above unless you keep track
-        // of which nodes you have already deleted
+        // Clear voxels in grid (O(1) per voxel)
         for sx in x..xp {
             for sy in y..yp {
                 for sz in z..zp {
-                    let voxel = octree.get_mut_or_create(Vector3::new(sx, sy, sz));
-                    *voxel = TreeBody::Empty;
+                    grid.clear(sx, sy, sz);
                 }
             }
         }
@@ -146,9 +247,9 @@ pub fn simplify_lossless(
     opts: &Obj2Brs,
     max_merge: isize,
 ) {
-    let d: isize = 1 << octree.size;
-    let len = d + 1;
-
+    // Convert octree to flat grid for O(1) access
+    let mut grid = VoxelGrid::from_octree(octree);
+    
     let colorset = convert_colorset_to_hsv(&save_data.colors);
 
     let scales: (isize, isize, isize) = if opts.bricktype == BrickType::Microbricks {
@@ -159,69 +260,53 @@ pub fn simplify_lossless(
 
     let max_scale = isize::max(isize::max(scales.0, scales.1), scales.2);
     let max_merge = max_merge / max_scale;
+    let grid_len = grid.size as isize;
 
-    loop {
-        let matched_color;
-        let unmatched_color;
-        let x;
-        let y;
-        let z;
-        {
-            let (location, voxel) = octree.get_any_mut_or_create();
-
-            x = location[0];
-            y = location[1];
-            z = location[2];
-
-            match voxel {
-                TreeBody::Leaf(leaf_color) => {
-                    let final_color = gamma_correct(*leaf_color);
-                    matched_color = match_hsv_to_colorset(&colorset, &rgb2hsv(final_color));
-                    unmatched_color = BrickColor::Unique(Color::new(
-                        final_color[0],
-                        final_color[1],
-                        final_color[2],
-                    ));
-                }
-                _ => break,
-            }
-        }
+    let mut search_idx = 0usize;
+    
+    while let Some((idx, x, y, z, first_color)) = grid.find_next_voxel(search_idx) {
+        search_idx = idx; // Start next search from here
+        
+        let final_color = gamma_correct(first_color);
+        let matched_color = match_hsv_to_colorset(&colorset, &rgb2hsv(final_color));
+        let unmatched_color = BrickColor::Unique(Color::new(
+            final_color[0],
+            final_color[1],
+            final_color[2],
+        ));
 
         let mut xp = x + 1;
         let mut yp = y + 1;
         let mut zp = z + 1;
 
-        // Expand z direction first due to octree ordering followed by y
-        // Ensures blocks are simplified in the pattern of Morton coding
-        while zp < len && (zp - z) < max_merge {
-            let voxel = octree.get_mut_or_create(Vector3::new(x, y, zp));
-            match voxel {
-                TreeBody::Leaf(leaf_color) => {
-                    let final_color = gamma_correct(*leaf_color);
-                    let color_temp = match_hsv_to_colorset(&colorset, &rgb2hsv(final_color));
-                    if color_temp != matched_color {
-                        break;
-                    }
-                    zp += 1;
+        // Expand z direction first
+        while zp - z < max_merge && zp < grid_len {
+            if let Some(color) = grid.get(x, y, zp) {
+                let fc = gamma_correct(color);
+                let color_temp = match_hsv_to_colorset(&colorset, &rgb2hsv(fc));
+                if color_temp != matched_color {
+                    break;
                 }
-                _ => break,
+                zp += 1;
+            } else {
+                break;
             }
         }
 
-        while yp < len && (yp - y) < max_merge {
+        // Expand y direction
+        while yp - y < max_merge && yp < grid_len {
             let mut pass = true;
             for sz in z..zp {
-                let voxel = octree.get_mut_or_create(Vector3::new(x, yp, sz));
-                match voxel {
-                    TreeBody::Leaf(leaf_color) => {
-                        let final_color = gamma_correct(*leaf_color);
-                        let color_temp = match_hsv_to_colorset(&colorset, &rgb2hsv(final_color));
+                match grid.get(x, yp, sz) {
+                    Some(color) => {
+                        let fc = gamma_correct(color);
+                        let color_temp = match_hsv_to_colorset(&colorset, &rgb2hsv(fc));
                         if color_temp != matched_color {
                             pass = false;
                             break;
                         }
                     }
-                    _ => {
+                    None => {
                         pass = false;
                         break;
                     }
@@ -233,29 +318,25 @@ pub fn simplify_lossless(
             yp += 1;
         }
 
-        while xp < len && (xp - x) < max_merge {
+        // Expand x direction
+        while xp - x < max_merge && xp < grid_len {
             let mut pass = true;
-            for sy in y..yp {
+            'outer: for sy in y..yp {
                 for sz in z..zp {
-                    let voxel = octree.get_mut_or_create(Vector3::new(xp, sy, sz));
-                    match voxel {
-                        TreeBody::Leaf(leaf_color) => {
-                            let final_color = gamma_correct(*leaf_color);
-                            let color_temp =
-                                match_hsv_to_colorset(&colorset, &rgb2hsv(final_color));
+                    match grid.get(xp, sy, sz) {
+                        Some(color) => {
+                            let fc = gamma_correct(color);
+                            let color_temp = match_hsv_to_colorset(&colorset, &rgb2hsv(fc));
                             if color_temp != matched_color {
                                 pass = false;
-                                break;
+                                break 'outer;
                             }
                         }
-                        _ => {
+                        None => {
                             pass = false;
-                            break;
+                            break 'outer;
                         }
                     }
-                }
-                if !pass {
-                    break;
                 }
             }
             if !pass {
@@ -264,14 +345,11 @@ pub fn simplify_lossless(
             xp += 1;
         }
 
-        // Clear nodes
-        // This cant be done during the loops above unless you keep track
-        // of which nodes you have already deleted
+        // Clear voxels in grid (O(1) per voxel)
         for sx in x..xp {
             for sy in y..yp {
                 for sz in z..zp {
-                    let voxel = octree.get_mut_or_create(Vector3::new(sx, sy, sz));
-                    *voxel = TreeBody::Empty;
+                    grid.clear(sx, sy, sz);
                 }
             }
         }

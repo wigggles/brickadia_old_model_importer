@@ -21,8 +21,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use crate::binary::{bytes_to_string, read_struct, seek_to};
-use crate::bsp::lump::{lump_index, read_lump_data, read_lump_table, LumpEntry};
+use crate::binary::{bytes_to_string, seek_to};
+use crate::bsp::lump::{lump_index, read_lump_data, read_lump_table};
 use crate::bsp::{BspData, Face, Vertex};
 use crate::BspResult;
 

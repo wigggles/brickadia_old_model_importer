@@ -21,7 +21,7 @@
 use bytemuck::{Pod, Zeroable};
 use std::io::{Read, Seek};
 
-use crate::binary::{read_struct, read_struct_array, seek_to};
+use crate::binary::{read_struct_array, seek_to};
 use crate::BspResult;
 
 // -----------------------------------------------------------------------------

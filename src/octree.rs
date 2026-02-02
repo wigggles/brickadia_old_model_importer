@@ -55,6 +55,7 @@ impl<T> VoxelTree<T> {
         (voxel.x + 1) <= high && (voxel.y + 1) <= high && (voxel.z + 1) <= high
     }
 
+    #[allow(dead_code)]
     pub fn grow_to_hold(&mut self, voxel: Vector3<isize>) {
         while !self.contains_bounds(voxel) {
             self.size += 1;
@@ -101,6 +102,7 @@ impl<T> VoxelTree<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_mut_or_create(&mut self, voxel: Vector3<isize>) -> &mut TreeBody<T> {
         self.grow_to_hold(voxel);
         let mut m = 1 << self.size;
@@ -137,6 +139,7 @@ impl<T> VoxelTree<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_any_mut_or_create(&mut self) -> (Vector3<isize>, &mut TreeBody<T>) {
         let mask = 1 << self.size;
         let voxel = Vector3::<isize>::new(-mask, -mask, -mask);
@@ -151,6 +154,7 @@ impl<T> VoxelTree<T> {
         }
     }
 
+    #[allow(dead_code)]
     fn get_any_recursive(
         branches: &mut Branches<T>,
         mask: isize,
