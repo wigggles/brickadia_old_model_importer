@@ -4,3 +4,6 @@
 [submodule "submodules/source_gold-converter-obj"]
 	path = submodules/source_gold-converter-obj
 	url = git@github.com:measuredweighed/BSP2OBJ.git
+[submodule "submodules/height_map_2brz"]
+	path = submodules/height_map_2brz
+	url = git@github.com:brickadia-community/heightmap2brz.git

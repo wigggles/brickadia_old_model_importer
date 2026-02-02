@@ -283,14 +283,20 @@ impl App for Obj2Brs {
                 ui.add_space(10.);
                 ui.horizontal(|ui| {
                     let available_width = ui.available_width();
-                    ui.add_space((available_width - 60.0) / 2.0);
-                    let button_text = if self.conversion_in_progress {
-                        "Converting..."
+                    if self.conversion_in_progress {
+                        // Show Converting + Cancel buttons centered
+                        ui.add_space((available_width - 160.0) / 2.0);
+                        ui.add_enabled(false, egui::Button::new("Converting..."));
+                        if ui.button("Cancel").clicked() {
+                            self.conversion_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.logger.log("Cancellation requested...".to_string());
+                        }
                     } else {
-                        "Voxelize"
-                    };
-                    if gui::button(ui, button_text, can_convert) {
-                        self.do_conversion()
+                        // Show Voxelize button centered
+                        ui.add_space((available_width - 60.0) / 2.0);
+                        if gui::button(ui, "Voxelize", can_convert) {
+                            self.do_conversion()
+                        }
                     }
                 });
                 ui.add_space(10.);
@@ -783,10 +789,21 @@ impl Obj2Brs {
             }
 
             // Convert BSP to OBJ
-            let bsp_result = bsp_converter::convert_bsp_to_obj_with_game(
+            // Check for external texture directory (VTF files for GoldSrc)
+            let texture_dir = Path::new("data/game_textures/goldsrc_textures/materials");
+            let texture_dir_opt = if texture_dir.exists() {
+                logger.log(format!("Using external textures from: {:?}", texture_dir));
+                Some(texture_dir)
+            } else {
+                logger.log("No external texture directory found, using embedded/inferred colors".to_string());
+                None
+            };
+            
+            let bsp_result = bsp_converter::convert_bsp_to_obj_with_game_and_textures(
                 &input_file_path,
                 &temp_dir,
                 bsp_game_source,
+                texture_dir_opt,
             );
 
             if let Err(e) = bsp_result {

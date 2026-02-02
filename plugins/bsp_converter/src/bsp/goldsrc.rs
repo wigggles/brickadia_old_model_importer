@@ -27,7 +27,7 @@ use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use crate::binary::{bytes_to_string, read_struct, read_struct_array, seek_to};
-use crate::bsp::{BspData, Face, Vertex};
+use crate::bsp::{BspData, Face, TextureData, Vertex};
 use crate::{BspError, BspResult};
 
 // =============================================================================
@@ -375,6 +375,17 @@ pub fn parse<P: AsRef<Path>>(path: P, palette: Option<&[u8]>) -> BspResult<BspDa
     // Build material name list
     let materials: Vec<String> = textures.iter().map(|t| t.name.clone()).collect();
 
+    // Convert GoldSrcTexture to TextureData for export
+    let texture_data: Vec<TextureData> = textures
+        .iter()
+        .map(|t| TextureData {
+            name: t.name.clone(),
+            width: t.width,
+            height: t.height,
+            pixels: t.pixels.clone(),
+        })
+        .collect();
+
     // Build vertices and faces with proper normals and UVs
     let (vertices, faces) = build_geometry(
         &raw_faces,
@@ -390,6 +401,7 @@ pub fn parse<P: AsRef<Path>>(path: P, palette: Option<&[u8]>) -> BspResult<BspDa
         vertices,
         faces,
         materials,
+        textures: texture_data,
     })
 }
 

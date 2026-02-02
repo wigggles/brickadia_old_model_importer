@@ -39,6 +39,26 @@ pub struct BspData {
 
     /// Material names referenced by faces.
     pub materials: Vec<String>,
+
+    /// Extracted texture data (optional, may be empty for external textures).
+    pub textures: Vec<TextureData>,
+}
+
+/// Extracted texture data from BSP.
+#[derive(Debug, Clone)]
+pub struct TextureData {
+    /// Texture name (used as filename when exporting).
+    pub name: String,
+
+    /// Width in pixels.
+    pub width: u32,
+
+    /// Height in pixels.
+    pub height: u32,
+
+    /// RGB pixel data (width * height * 3 bytes).
+    /// Empty if texture is external (e.g., in WAD file).
+    pub pixels: Vec<u8>,
 }
 
 /// A single vertex with position, UV, and normal.

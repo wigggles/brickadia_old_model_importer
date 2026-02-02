@@ -182,6 +182,7 @@ mod tests {
                 indices: vec![0, 1, 2],
             }],
             materials: vec!["test_material".to_string()],
+            textures: vec![],
         };
 
         // Write to temp directory

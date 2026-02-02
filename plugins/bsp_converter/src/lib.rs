@@ -131,6 +131,9 @@ pub enum BspError {
     #[error("Invalid BSP file: {0}")]
     InvalidFile(String),
 
+    #[error("Invalid format: {0}")]
+    InvalidFormat(String),
+
     #[error("Texture extraction error: {0}")]
     TextureError(String),
 
@@ -182,8 +185,27 @@ pub fn convert_bsp_to_obj<P: AsRef<Path>, Q: AsRef<Path>>(
     bsp_path: P,
     output_dir: Q,
 ) -> BspResult<()> {
+    convert_bsp_to_obj_with_textures(bsp_path, output_dir, None::<&Path>)
+}
+
+/// Convert a BSP file to OBJ format with optional external texture directory.
+///
+/// If `texture_dir` is provided, external textures (VTF files) will be loaded
+/// from that directory to fill in textures not embedded in the BSP.
+///
+/// # Arguments
+///
+/// * `bsp_path` - Path to the input BSP file.
+/// * `output_dir` - Directory where OBJ, MTL, and textures will be written.
+/// * `texture_dir` - Optional path to directory containing VTF texture files.
+pub fn convert_bsp_to_obj_with_textures<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
+    bsp_path: P,
+    output_dir: Q,
+    texture_dir: Option<R>,
+) -> BspResult<()> {
     let bsp_path = bsp_path.as_ref();
     let output_dir = output_dir.as_ref();
+    let texture_dir = texture_dir.as_ref().map(|p| p.as_ref());
 
     // Step 1: Detect format — GoldSrc has no "IBSP" signature
     if let Some(goldsrc_version) = bsp::goldsrc::detect_goldsrc_version(bsp_path)? {
@@ -191,7 +213,13 @@ pub fn convert_bsp_to_obj<P: AsRef<Path>, Q: AsRef<Path>>(
         match goldsrc_version {
             bsp::goldsrc::VERSION_HALFLIFE | bsp::goldsrc::VERSION_QUAKE1 => {
                 // Parse GoldSrc BSP (no external palette for HL1 — it's embedded)
-                let bsp_data = bsp::goldsrc::parse(bsp_path, None)?;
+                let mut bsp_data = bsp::goldsrc::parse(bsp_path, None)?;
+                
+                // Load external textures from VTF files if texture_dir provided
+                if let Some(tex_dir) = texture_dir {
+                    load_external_textures(&mut bsp_data, tex_dir);
+                }
+                
                 obj::writer::write_obj(&bsp_data, output_dir)?;
                 obj::mtl::write_mtl(&bsp_data, output_dir)?;
             }
@@ -225,6 +253,23 @@ pub fn convert_bsp_to_obj<P: AsRef<Path>, Q: AsRef<Path>>(
     }
 
     Ok(())
+}
+
+/// Load external textures from VTF files for materials with empty pixel data.
+fn load_external_textures(bsp_data: &mut bsp::BspData, texture_dir: &Path) {
+    for texture in &mut bsp_data.textures {
+        // Skip if already has pixel data
+        if !texture.pixels.is_empty() {
+            continue;
+        }
+        
+        // Try to find VTF file
+        if let Some(vtf) = texture::vtf::find_texture(&texture.name, texture_dir) {
+            texture.width = vtf.width;
+            texture.height = vtf.height;
+            texture.pixels = vtf.pixels;
+        }
+    }
 }
 
 /// Detect the game source from a BSP file.
@@ -296,8 +341,26 @@ pub fn convert_bsp_to_obj_with_game<P: AsRef<Path>, Q: AsRef<Path>>(
     output_dir: Q,
     game: GameSource,
 ) -> BspResult<()> {
+    convert_bsp_to_obj_with_game_and_textures(bsp_path, output_dir, game, None::<&Path>)
+}
+
+/// Convert a BSP file to OBJ format with explicit game source and texture directory.
+///
+/// # Arguments
+///
+/// * `bsp_path` - Path to the input BSP file.
+/// * `output_dir` - Directory where OBJ, MTL, and textures will be written.
+/// * `game` - The game source to use. If `GameSource::Auto`, auto-detection is used.
+/// * `texture_dir` - Optional path to directory containing VTF texture files.
+pub fn convert_bsp_to_obj_with_game_and_textures<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
+    bsp_path: P,
+    output_dir: Q,
+    game: GameSource,
+    texture_dir: Option<R>,
+) -> BspResult<()> {
     let bsp_path = bsp_path.as_ref();
     let output_dir = output_dir.as_ref();
+    let texture_dir = texture_dir.as_ref().map(|p| p.as_ref());
 
     // If Auto, use auto-detection
     let game = if game == GameSource::Auto {
@@ -314,7 +377,13 @@ pub fn convert_bsp_to_obj_with_game<P: AsRef<Path>, Q: AsRef<Path>>(
     // Dispatch to appropriate parser
     match game {
         GameSource::HalfLife1 | GameSource::Quake1 => {
-            let bsp_data = bsp::goldsrc::parse(bsp_path, None)?;
+            let mut bsp_data = bsp::goldsrc::parse(bsp_path, None)?;
+            
+            // Load external textures from VTF files if texture_dir provided
+            if let Some(tex_dir) = texture_dir {
+                load_external_textures(&mut bsp_data, tex_dir);
+            }
+            
             obj::writer::write_obj(&bsp_data, output_dir)?;
             obj::mtl::write_mtl(&bsp_data, output_dir)?;
         }

@@ -218,6 +218,7 @@ pub fn parse<P: AsRef<Path>>(path: P) -> BspResult<BspData> {
         vertices,
         faces,
         materials,
+        textures: Vec::new(), // CoD1 textures are external, not embedded
     })
 }
 

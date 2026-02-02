@@ -19,5 +19,8 @@ zip = "0.6"
 # Error handling
 thiserror = "1.0"
 
+# Image encoding for texture export
+image = "0.24"
+
 # Serialization (optional, for GUI integration)
 serde = { version = "1.0", features = ["derive"], optional = true }
