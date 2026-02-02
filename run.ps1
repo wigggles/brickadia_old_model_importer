@@ -28,6 +28,7 @@ if ($Release) {
     cargo run --release
 } else {
     Write-Host "Building in DEBUG mode (fast compile, for development)..." -ForegroundColor Green
+    $env:RUST_BACKTRACE = "1"
     cargo run
 }
 

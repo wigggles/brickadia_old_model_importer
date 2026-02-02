@@ -9,6 +9,7 @@ mod logger;
 mod octree;
 mod palette;
 mod simplify;
+mod simplify_direct;
 mod voxelize;
 
 use bsp_converter::{GameSource, is_bsp_file, detect_game_source};
@@ -83,6 +84,27 @@ pub struct Obj2Brs {
     grid_offset_x: f32,
     grid_offset_y: f32,
     grid_offset_z: f32,
+    /// Rotation around X axis in 90° increments (0, 90, 180, 270)
+    #[serde(default)]
+    rotation_x: i32,
+    /// Rotation around Y axis in 90° increments (0, 90, 180, 270)
+    #[serde(default)]
+    rotation_y: i32,
+    /// Rotation around Z axis in 90° increments (0, 90, 180, 270)
+    #[serde(default)]
+    rotation_z: i32,
+    /// Add origin marker with color-coded X/Y/Z axis bricks
+    #[serde(default)]
+    show_origin_marker: bool,
+    /// Scale multiplier for X axis (default 1.0)
+    #[serde(default = "default_axis_scale")]
+    scale_x: f32,
+    /// Scale multiplier for Y axis (default 1.0)
+    #[serde(default = "default_axis_scale")]
+    scale_y: f32,
+    /// Scale multiplier for Z axis (default 1.0) - adjust to fix squished height
+    #[serde(default = "default_axis_scale")]
+    scale_z: f32,
     #[serde(skip)]
     missing_resources_dialog: Option<String>,
     #[serde(skip)]
@@ -110,6 +132,63 @@ pub struct Obj2Brs {
     /// Detected game source (for display, may differ from selected).
     #[serde(skip)]
     detected_game_source: Option<GameSource>,
+    
+    // Settings profiles
+    /// Saved settings profiles
+    #[serde(default)]
+    profiles: Vec<SettingsProfile>,
+    /// Currently selected profile index (None = custom/unsaved)
+    #[serde(skip)]
+    selected_profile_index: Option<usize>,
+    /// Name for new profile when saving
+    #[serde(skip)]
+    new_profile_name: String,
+}
+
+fn default_axis_scale() -> f32 {
+    1.0
+}
+
+/// A settings profile containing conversion settings (not paths).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingsProfile {
+    pub name: String,
+    pub bricktype: BrickType,
+    pub brick_scale: isize,
+    pub material: Material,
+    pub material_intensity: u32,
+    pub scale: f32,
+    pub simplify: bool,
+    pub match_brickadia_colorset: bool,
+    pub rotation_x: i32,
+    pub rotation_y: i32,
+    pub rotation_z: i32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub scale_z: f32,
+    pub show_origin_marker: bool,
+}
+
+impl Default for SettingsProfile {
+    fn default() -> Self {
+        Self {
+            name: "Default".to_string(),
+            bricktype: BrickType::Microbricks,
+            brick_scale: 1,
+            material: Material::Plastic,
+            material_intensity: 5,
+            scale: 1.0,
+            simplify: false,
+            match_brickadia_colorset: false,
+            rotation_x: 0,
+            rotation_y: 0,
+            rotation_z: 0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            scale_z: 1.0,
+            show_origin_marker: false,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
@@ -163,6 +242,13 @@ impl Default for Obj2Brs {
             grid_offset_x: 0.0,
             grid_offset_y: 0.0,
             grid_offset_z: 0.0,
+            rotation_x: 0,
+            rotation_y: 0,
+            rotation_z: 0,
+            show_origin_marker: false,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            scale_z: 1.0,
             missing_resources_dialog: None,
             pending_conversion_skip_textures: false,
             logger: Logger::new(),
@@ -175,6 +261,10 @@ impl Default for Obj2Brs {
             input_file_type: InputFileType::Obj,
             bsp_game_source: GameSource::Auto,
             detected_game_source: None,
+            // Profiles
+            profiles: Vec::new(),
+            selected_profile_index: None,
+            new_profile_name: String::new(),
         }
     }
 }
@@ -262,6 +352,13 @@ impl App for Obj2Brs {
             ScrollArea::vertical().show(ui, |ui| {
                 gui::add_grid(ui, "paths_grid", |ui| self.paths(ui, input_file_valid, output_dir_valid));
                 gui::add_horizontal_line(ui);
+                
+                // Settings profiles section
+                ui.add_space(5.);
+                self.profiles_ui(ui);
+                ui.add_space(5.);
+                gui::add_horizontal_line(ui);
+                
                 gui::add_grid(ui, "options_grid", |ui| self.options(ui, uuid_valid));
 
                 ui.add_space(5.);
@@ -540,6 +637,265 @@ impl Obj2Brs {
                 ui.selectable_value(&mut self.material, Material::Ghost, "Ghost");
             });
         ui.end_row();
+
+        // Rotation overrides
+        ui.label("Rotation X").on_hover_text(
+            "Rotate model around the X axis (left-right axis).\n\n\
+            In Brickadia coordinates:\n\
+            • 0° = No rotation\n\
+            • 90° = Tilt forward (top faces you)\n\
+            • 180° = Flip upside down\n\
+            • 270° = Tilt backward (bottom faces you)\n\n\
+            Use this to fix models that appear tilted forward/back.",
+        );
+        ComboBox::from_id_source("rotation_x")
+            .selected_text(format!("{}°", self.rotation_x))
+            .show_ui(ui, |ui: &mut Ui| {
+                ui.selectable_value(&mut self.rotation_x, 0, "0°");
+                ui.selectable_value(&mut self.rotation_x, 90, "90°");
+                ui.selectable_value(&mut self.rotation_x, 180, "180°");
+                ui.selectable_value(&mut self.rotation_x, 270, "270°");
+            });
+        ui.end_row();
+
+        ui.label("Rotation Y").on_hover_text(
+            "Rotate model around the Y axis (forward-back axis).\n\n\
+            In Brickadia coordinates:\n\
+            • 0° = No rotation\n\
+            • 90° = Roll left (left side up)\n\
+            • 180° = Flip left-right\n\
+            • 270° = Roll right (right side up)\n\n\
+            Use this to fix models that appear rolled/tilted sideways.",
+        );
+        ComboBox::from_id_source("rotation_y")
+            .selected_text(format!("{}°", self.rotation_y))
+            .show_ui(ui, |ui: &mut Ui| {
+                ui.selectable_value(&mut self.rotation_y, 0, "0°");
+                ui.selectable_value(&mut self.rotation_y, 90, "90°");
+                ui.selectable_value(&mut self.rotation_y, 180, "180°");
+                ui.selectable_value(&mut self.rotation_y, 270, "270°");
+            });
+        ui.end_row();
+
+        ui.label("Rotation Z").on_hover_text(
+            "Rotate model around the Z axis (up-down axis).\n\n\
+            In Brickadia coordinates:\n\
+            • 0° = No rotation\n\
+            • 90° = Spin 90° counter-clockwise (viewed from above)\n\
+            • 180° = Face opposite direction\n\
+            • 270° = Spin 90° clockwise (viewed from above)\n\n\
+            Use this to change which direction the model faces.",
+        );
+        ComboBox::from_id_source("rotation_z")
+            .selected_text(format!("{}°", self.rotation_z))
+            .show_ui(ui, |ui: &mut Ui| {
+                ui.selectable_value(&mut self.rotation_z, 0, "0°");
+                ui.selectable_value(&mut self.rotation_z, 90, "90°");
+                ui.selectable_value(&mut self.rotation_z, 180, "180°");
+                ui.selectable_value(&mut self.rotation_z, 270, "270°");
+            });
+        ui.end_row();
+
+        ui.label("Origin Marker").on_hover_text(
+            "Add color-coded axis markers at the origin (0,0,0) for alignment testing.\n\n\
+            In Brickadia coordinates:\n\
+            • White brick at origin center\n\
+            • Red bricks along +X axis (right in Brickadia)\n\
+            • Green bricks along +Y axis (forward in Brickadia)\n\
+            • Blue bricks along +Z axis (up in Brickadia)\n\n\
+            Useful for verifying model orientation after import.",
+        );
+        ui.add(Checkbox::new(&mut self.show_origin_marker, "Show XYZ Axis"));
+        ui.end_row();
+
+        // Axis scale overrides
+        ui.label("Scale X").on_hover_text(
+            "Scale multiplier for the X axis (left-right in Brickadia).\n\n\
+            Default: 1.0 (no change)\n\
+            Use values > 1.0 to stretch, < 1.0 to compress.\n\n\
+            Adjust if model appears stretched or squished horizontally.",
+        );
+        ui.add(
+            DragValue::new(&mut self.scale_x)
+                .min_decimals(2)
+                .prefix("x")
+                .speed(0.01)
+                .range(0.1..=10.0),
+        );
+        ui.end_row();
+
+        ui.label("Scale Y").on_hover_text(
+            "Scale multiplier for the Y axis (forward-back in Brickadia).\n\n\
+            Default: 1.0 (no change)\n\
+            Use values > 1.0 to stretch, < 1.0 to compress.\n\n\
+            Adjust if model appears stretched or squished in depth.",
+        );
+        ui.add(
+            DragValue::new(&mut self.scale_y)
+                .min_decimals(2)
+                .prefix("x")
+                .speed(0.01)
+                .range(0.1..=10.0),
+        );
+        ui.end_row();
+
+        ui.label("Scale Z").on_hover_text(
+            "Scale multiplier for the Z axis (up-down in Brickadia).\n\n\
+            Default: 1.0 (no change)\n\
+            Use values > 1.0 to stretch vertically, < 1.0 to compress.\n\n\
+            **Common fix**: If model appears squished/flat, try 2.5 to compensate\n\
+            for Brickadia's plate height ratio (plates are 2.5x shorter than wide).",
+        );
+        ui.add(
+            DragValue::new(&mut self.scale_z)
+                .min_decimals(2)
+                .prefix("x")
+                .speed(0.01)
+                .range(0.1..=10.0),
+        );
+        ui.end_row();
+    }
+
+    fn profiles_ui(&mut self, ui: &mut Ui) {
+        let mut profile_to_load: Option<usize> = None;
+        
+        ui.horizontal(|ui| {
+            ui.label("Profile:");
+            
+            // Profile dropdown
+            let current_name = if let Some(idx) = self.selected_profile_index {
+                if idx < self.profiles.len() {
+                    self.profiles[idx].name.clone()
+                } else {
+                    "Custom".to_string()
+                }
+            } else {
+                "Custom".to_string()
+            };
+            
+            ComboBox::from_id_source("profile_select")
+                .selected_text(&current_name)
+                .show_ui(ui, |ui: &mut Ui| {
+                    if ui.selectable_label(self.selected_profile_index.is_none(), "Custom").clicked() {
+                        self.selected_profile_index = None;
+                    }
+                    for i in 0..self.profiles.len() {
+                        let name = self.profiles[i].name.clone();
+                        if ui.selectable_label(self.selected_profile_index == Some(i), &name).clicked() {
+                            profile_to_load = Some(i);
+                        }
+                    }
+                });
+        });
+        
+        // Load profile outside the borrow
+        if let Some(idx) = profile_to_load {
+            self.load_profile(idx);
+        }
+        
+        ui.horizontal(|ui| {
+            // Save current settings as new profile
+            ui.add(TextEdit::singleline(&mut self.new_profile_name).hint_text("Profile name").desired_width(120.0));
+            if ui.button("Save").on_hover_text("Save current settings as a new profile").clicked() {
+                if !self.new_profile_name.trim().is_empty() {
+                    self.save_as_profile(self.new_profile_name.trim().to_string());
+                    self.new_profile_name.clear();
+                }
+            }
+            
+            // Delete selected profile
+            if self.selected_profile_index.is_some() {
+                if ui.button("Delete").on_hover_text("Delete the selected profile").clicked() {
+                    if let Some(idx) = self.selected_profile_index {
+                        if idx < self.profiles.len() {
+                            self.profiles.remove(idx);
+                            self.selected_profile_index = None;
+                        }
+                    }
+                }
+            }
+            
+            // Reset to defaults button
+            if ui.button("Reset").on_hover_text("Reset all settings to default values").clicked() {
+                self.reset_to_defaults();
+            }
+        });
+    }
+
+    fn reset_to_defaults(&mut self) {
+        let defaults = SettingsProfile::default();
+        self.bricktype = defaults.bricktype;
+        self.brick_scale = defaults.brick_scale;
+        self.material = defaults.material;
+        self.material_intensity = defaults.material_intensity;
+        self.scale = defaults.scale;
+        self.simplify = defaults.simplify;
+        self.match_brickadia_colorset = defaults.match_brickadia_colorset;
+        self.rotation_x = defaults.rotation_x;
+        self.rotation_y = defaults.rotation_y;
+        self.rotation_z = defaults.rotation_z;
+        self.scale_x = defaults.scale_x;
+        self.scale_y = defaults.scale_y;
+        self.scale_z = defaults.scale_z;
+        self.show_origin_marker = defaults.show_origin_marker;
+        self.selected_profile_index = None;
+        self.logger.log("Reset settings to defaults".to_string());
+    }
+
+    fn save_as_profile(&mut self, name: String) {
+        let profile = SettingsProfile {
+            name: name.clone(),
+            bricktype: self.bricktype,
+            brick_scale: self.brick_scale,
+            material: self.material,
+            material_intensity: self.material_intensity,
+            scale: self.scale,
+            simplify: self.simplify,
+            match_brickadia_colorset: self.match_brickadia_colorset,
+            rotation_x: self.rotation_x,
+            rotation_y: self.rotation_y,
+            rotation_z: self.rotation_z,
+            scale_x: self.scale_x,
+            scale_y: self.scale_y,
+            scale_z: self.scale_z,
+            show_origin_marker: self.show_origin_marker,
+        };
+        
+        // Check if profile with same name exists, update it
+        if let Some(idx) = self.profiles.iter().position(|p| p.name == name) {
+            self.profiles[idx] = profile;
+            self.selected_profile_index = Some(idx);
+        } else {
+            self.profiles.push(profile);
+            self.selected_profile_index = Some(self.profiles.len() - 1);
+        }
+        
+        self.logger.log(format!("Saved profile: {}", name));
+    }
+
+    fn load_profile(&mut self, index: usize) {
+        if index >= self.profiles.len() {
+            return;
+        }
+        
+        let profile = &self.profiles[index];
+        self.bricktype = profile.bricktype;
+        self.brick_scale = profile.brick_scale;
+        self.material = profile.material;
+        self.material_intensity = profile.material_intensity;
+        self.scale = profile.scale;
+        self.simplify = profile.simplify;
+        self.match_brickadia_colorset = profile.match_brickadia_colorset;
+        self.rotation_x = profile.rotation_x;
+        self.rotation_y = profile.rotation_y;
+        self.rotation_z = profile.rotation_z;
+        self.scale_x = profile.scale_x;
+        self.scale_y = profile.scale_y;
+        self.scale_z = profile.scale_z;
+        self.show_origin_marker = profile.show_origin_marker;
+        
+        self.selected_profile_index = Some(index);
+        self.logger.log(format!("Loaded profile: {}", profile.name));
     }
 
     fn advanced_options(&mut self, ui: &mut Ui, uuid_valid: bool) {
@@ -805,6 +1161,13 @@ impl Obj2Brs {
         let grid_offset_x = self.grid_offset_x;
         let grid_offset_y = self.grid_offset_y;
         let grid_offset_z = self.grid_offset_z;
+        let rotation_x = self.rotation_x;
+        let rotation_y = self.rotation_y;
+        let rotation_z = self.rotation_z;
+        let show_origin_marker = self.show_origin_marker;
+        let scale_x = self.scale_x;
+        let scale_y = self.scale_y;
+        let scale_z = self.scale_z;
         let match_brickadia_colorset = self.match_brickadia_colorset;
         let brick_scale = self.brick_scale;
         let material = self.material;
@@ -917,6 +1280,13 @@ impl Obj2Brs {
                 grid_offset_x,
                 grid_offset_y,
                 grid_offset_z,
+                rotation_x,
+                rotation_y,
+                rotation_z,
+                show_origin_marker,
+                scale_x,
+                scale_y,
+                scale_z,
                 missing_resources_dialog: None,
                 pending_conversion_skip_textures: false,
                 logger: logger.clone(),
@@ -928,6 +1298,9 @@ impl Obj2Brs {
                 input_file_type: InputFileType::Obj,
                 bsp_game_source: GameSource::Auto,
                 detected_game_source: None,
+                profiles: Vec::new(),
+                selected_profile_index: None,
+                new_profile_name: String::new(),
             };
 
             // Load textures from BSP-converted OBJs (PNG textures exported from VTF files)
@@ -974,6 +1347,13 @@ impl Obj2Brs {
         let grid_offset_x = self.grid_offset_x;
         let grid_offset_y = self.grid_offset_y;
         let grid_offset_z = self.grid_offset_z;
+        let rotation_x = self.rotation_x;
+        let rotation_y = self.rotation_y;
+        let rotation_z = self.rotation_z;
+        let show_origin_marker = self.show_origin_marker;
+        let scale_x = self.scale_x;
+        let scale_y = self.scale_y;
+        let scale_z = self.scale_z;
         let match_brickadia_colorset = self.match_brickadia_colorset;
         let brick_scale = self.brick_scale;
         let material = self.material;
@@ -1005,6 +1385,13 @@ impl Obj2Brs {
                 grid_offset_x,
                 grid_offset_y,
                 grid_offset_z,
+                rotation_x,
+                rotation_y,
+                rotation_z,
+                show_origin_marker,
+                scale_x,
+                scale_y,
+                scale_z,
                 missing_resources_dialog: None,
                 pending_conversion_skip_textures: false,
                 logger: logger.clone(),
@@ -1017,6 +1404,9 @@ impl Obj2Brs {
                 input_file_type: InputFileType::Obj,
                 bsp_game_source: GameSource::Auto,
                 detected_game_source: None,
+                profiles: Vec::new(),
+                selected_profile_index: None,
+                new_profile_name: String::new(),
             };
 
             if let Err(e) = perform_conversion(&opts, skip_textures) {
@@ -1355,23 +1745,229 @@ fn load_models_and_materials(
         }
     }
 
-    // Scale models
-    scale_models(&mut models, opt.scale, opt.bricktype);
+    // Check for large coordinate ranges and warn user
+    check_model_bounds(&models, opt);
+
+    // Apply rotation if any rotation is set
+    if opt.rotation_x != 0 || opt.rotation_y != 0 || opt.rotation_z != 0 {
+        rotate_models(&mut models, opt.rotation_x, opt.rotation_y, opt.rotation_z);
+        opt.logger.log(format!(
+            "Applied rotation: X={}°, Y={}°, Z={}°",
+            opt.rotation_x, opt.rotation_y, opt.rotation_z
+        ));
+    }
+
+    // Scale models (also centers at origin)
+    scale_models(&mut models, opt.scale, opt.scale_x, opt.scale_y, opt.scale_z);
 
     Ok((models, material_images))
 }
 
-fn scale_models(models: &mut [tobj::Model], scale: f32, bricktype: BrickType) {
-    // Determine model AABB to expand triangle octree to final size
-    // Multiply y-coordinate by 2.5 to take into account plates
-    let yscale = if bricktype == BrickType::Microbricks { 1.0 } else { 2.5 };
+fn check_model_bounds(models: &[tobj::Model], opt: &Obj2Brs) {
+    if let Some(first_model) = models.first() {
+        let positions = &first_model.mesh.positions;
+        if !positions.is_empty() {
+            let mut min_x = positions[0];
+            let mut max_x = positions[0];
+            let mut min_y = positions[1];
+            let mut max_y = positions[1];
+            let mut min_z = positions[2];
+            let mut max_z = positions[2];
 
+            for m in models.iter() {
+                let p = &m.mesh.positions;
+                for v in (0..p.len()).step_by(3) {
+                    min_x = min_x.min(p[v]);
+                    max_x = max_x.max(p[v]);
+                    min_y = min_y.min(p[v + 1]);
+                    max_y = max_y.max(p[v + 1]);
+                    min_z = min_z.min(p[v + 2]);
+                    max_z = max_z.max(p[v + 2]);
+                }
+            }
+
+            let range_x = max_x - min_x;
+            let range_y = max_y - min_y;
+            let range_z = max_z - min_z;
+            let max_range = range_x.max(range_y).max(range_z);
+
+            debug_log(&opt.logger, format!(
+                "Model bounds: X[{:.1}, {:.1}] Y[{:.1}, {:.1}] Z[{:.1}, {:.1}]",
+                min_x, max_x, min_y, max_y, min_z, max_z
+            ));
+            debug_log(&opt.logger, format!(
+                "Model size: {:.1} x {:.1} x {:.1} units (max: {:.1})",
+                range_x, range_y, range_z, max_range
+            ));
+
+            // Warn if model has very large coordinates (typical for BSP maps)
+            if max_range > 10000.0 {
+                opt.logger.log(format!(
+                    "⚠ WARNING: Model is very large ({:.0} units). This may require significant memory.",
+                    max_range
+                ));
+                opt.logger.log("Model will be centered at origin before scaling to optimize memory usage.".to_string());
+            } else if max_range > 5000.0 {
+                opt.logger.log(format!(
+                    "Note: Large model detected ({:.0} units). Centering at origin for better memory efficiency.",
+                    max_range
+                ));
+            }
+        }
+    }
+}
+
+/// Rotate models around X, Y, Z axes by the given angles (in degrees, must be 0, 90, 180, or 270).
+/// 
+/// The UI describes rotations in Brickadia coordinates (Z-up), but OBJ files use Y-up.
+/// Since the simplify code swaps Y↔Z when creating bricks, we need to swap the rotation axes:
+/// - UI "Rotation X" (Brickadia left-right) → OBJ X axis
+/// - UI "Rotation Y" (Brickadia forward-back) → OBJ Z axis (swapped)
+/// - UI "Rotation Z" (Brickadia up-down) → OBJ Y axis (swapped)
+///
+/// Rotation is applied in order: X, then Y (mapped to OBJ Z), then Z (mapped to OBJ Y).
+/// The model is first centered at the origin, rotated, then the center is preserved.
+fn rotate_models(models: &mut [tobj::Model], rot_x: i32, rot_y: i32, rot_z: i32) {
+    // Map Brickadia axes to OBJ axes (Y↔Z swap)
+    let obj_rot_x = rot_x;  // X stays the same
+    let obj_rot_y = rot_z;  // Brickadia Z (up) → OBJ Y (up)
+    let obj_rot_z = rot_y;  // Brickadia Y (forward) → OBJ Z (forward)
+    
+    // First, find the center of the model's bounding box
+    let (center_x, center_y, center_z) = if let Some(first_model) = models.first() {
+        let positions = &first_model.mesh.positions;
+        if !positions.is_empty() {
+            let mut min_x = positions[0];
+            let mut max_x = positions[0];
+            let mut min_y = positions[1];
+            let mut max_y = positions[1];
+            let mut min_z = positions[2];
+            let mut max_z = positions[2];
+
+            for m in models.iter() {
+                let p = &m.mesh.positions;
+                for v in (0..p.len()).step_by(3) {
+                    min_x = min_x.min(p[v]);
+                    max_x = max_x.max(p[v]);
+                    min_y = min_y.min(p[v + 1]);
+                    max_y = max_y.max(p[v + 1]);
+                    min_z = min_z.min(p[v + 2]);
+                    max_z = max_z.max(p[v + 2]);
+                }
+            }
+            ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0, (min_z + max_z) / 2.0)
+        } else {
+            (0.0, 0.0, 0.0)
+        }
+    } else {
+        return;
+    };
+
+    // Apply rotation to each vertex
     for m in models.iter_mut() {
         let p = &mut m.mesh.positions;
         for v in (0..p.len()).step_by(3) {
-            p[v] *= scale;
-            p[v + 1] *= yscale * scale;
-            p[v + 2] *= scale;
+            // Translate to origin
+            let mut x = p[v] - center_x;
+            let mut y = p[v + 1] - center_y;
+            let mut z = p[v + 2] - center_z;
+
+            // Rotate around OBJ X axis (Brickadia X - left/right)
+            if obj_rot_x != 0 {
+                let (new_y, new_z) = rotate_2d(y, z, obj_rot_x);
+                y = new_y;
+                z = new_z;
+            }
+
+            // Rotate around OBJ Y axis (Brickadia Z - up/down, spin in place)
+            if obj_rot_y != 0 {
+                let (new_x, new_z) = rotate_2d(x, z, obj_rot_y);
+                x = new_x;
+                z = new_z;
+            }
+
+            // Rotate around OBJ Z axis (Brickadia Y - forward/back)
+            if obj_rot_z != 0 {
+                let (new_x, new_y) = rotate_2d(x, y, obj_rot_z);
+                x = new_x;
+                y = new_y;
+            }
+
+            // Translate back (keep centered for now, scale_models will re-center)
+            p[v] = x + center_x;
+            p[v + 1] = y + center_y;
+            p[v + 2] = z + center_z;
+        }
+    }
+}
+
+/// Rotate a 2D point (a, b) by the given angle in degrees (0, 90, 180, 270).
+/// Returns the rotated point.
+#[inline]
+fn rotate_2d(a: f32, b: f32, degrees: i32) -> (f32, f32) {
+    match degrees % 360 {
+        90 | -270 => (-b, a),
+        180 | -180 => (-a, -b),
+        270 | -90 => (b, -a),
+        _ => (a, b), // 0 degrees or invalid
+    }
+}
+
+fn scale_models(models: &mut [tobj::Model], scale: f32, scale_x: f32, scale_y: f32, scale_z: f32) {
+    // Apply base scale plus per-axis scale multipliers.
+    // Note: scale_x/y/z are in Brickadia coordinates, but OBJ uses Y-up.
+    // Since simplify swaps Y↔Z, we need to swap scale_y and scale_z here.
+    let final_scale_x = scale * scale_x;  // Brickadia X = OBJ X
+    let final_scale_y = scale * scale_z;  // Brickadia Z (up) = OBJ Y (up)
+    let final_scale_z = scale * scale_y;  // Brickadia Y (forward) = OBJ Z (forward)
+
+    // First, find the center of the model's bounding box
+    if let Some(first_model) = models.first() {
+        let positions = &first_model.mesh.positions;
+        if !positions.is_empty() {
+            let mut min_x = positions[0];
+            let mut max_x = positions[0];
+            let mut min_y = positions[1];
+            let mut max_y = positions[1];
+            let mut min_z = positions[2];
+            let mut max_z = positions[2];
+
+            for m in models.iter() {
+                let p = &m.mesh.positions;
+                for v in (0..p.len()).step_by(3) {
+                    min_x = min_x.min(p[v]);
+                    max_x = max_x.max(p[v]);
+                    min_y = min_y.min(p[v + 1]);
+                    max_y = max_y.max(p[v + 1]);
+                    min_z = min_z.min(p[v + 2]);
+                    max_z = max_z.max(p[v + 2]);
+                }
+            }
+
+            // Calculate center offset
+            let center_x = (min_x + max_x) / 2.0;
+            let center_y = (min_y + max_y) / 2.0;
+            let center_z = (min_z + max_z) / 2.0;
+
+            // Translate model to origin (center it)
+            for m in models.iter_mut() {
+                let p = &mut m.mesh.positions;
+                for v in (0..p.len()).step_by(3) {
+                    p[v] -= center_x;
+                    p[v + 1] -= center_y;
+                    p[v + 2] -= center_z;
+                }
+            }
+        }
+    }
+
+    // Now apply scaling
+    for m in models.iter_mut() {
+        let p = &mut m.mesh.positions;
+        for v in (0..p.len()).step_by(3) {
+            p[v] *= final_scale_x;
+            p[v + 1] *= final_scale_y;
+            p[v + 2] *= final_scale_z;
         }
     }
 
@@ -1494,6 +2090,24 @@ fn voxelize_models(
     let rate_fmt = format_number(rate);
     opts.logger.log(format!("Voxelization completed: {} voxels in {:.2?} (~{}/s avg)", voxels_fmt, elapsed, rate_fmt));
     
+    // Log octree size and check if it's too large for simplification
+    let grid_size = 1u64 << (result.size + 1);
+    debug_log(&opts.logger, format!("Octree size: {} (grid dimensions: {}³)", result.size, grid_size));
+    
+    // Warn if octree is very large (will cause issues during simplification)
+    let grid_volume = grid_size.pow(3);
+    let bytes_per_voxel = std::mem::size_of::<Option<cgmath::Vector4<u8>>>() as u64;
+    let estimated_bytes = grid_volume.saturating_mul(bytes_per_voxel);
+    let estimated_gb = estimated_bytes as f64 / 1_073_741_824.0;
+    
+    if estimated_gb > 16.0 {
+        opts.logger.log(format!(
+            "⚠ WARNING: Octree is very large ({}³ grid = {:.1} GB for simplification).",
+            grid_size, estimated_gb
+        ));
+        opts.logger.log("Simplification will be skipped to prevent memory overflow.".to_string());
+    }
+    
     result
 }
 
@@ -1512,27 +2126,57 @@ fn write_brz_data(octree: &mut octree::VoxelTree<Vector4<u8>>, opts: &Obj2Brs, m
         author_name: opts.save_owner_name.clone(),
     };
 
-    set_progress(opts, 60, "Simplifying... (this may take 5-10 minutes for complex models)");
-    if let Some(id) = material_id {
-        opts.logger.log(format!("Simplifying material {}... (please wait, this can take several minutes)", id));
+    // Check if octree is too large for simplification (would cause memory overflow)
+    // VoxelGrid allocates size³ where size = 2^(octree.size+1)
+    // We need to ensure size³ * sizeof(Option<Vector4<u8>>) < reasonable memory limit
+    let grid_size = 1u64 << (octree.size + 1);
+    let grid_volume = grid_size.pow(3);
+    let bytes_per_voxel = std::mem::size_of::<Option<Vector4<u8>>>() as u64;
+    let estimated_bytes = grid_volume.saturating_mul(bytes_per_voxel);
+    let estimated_gb = estimated_bytes as f64 / 1_073_741_824.0;
+    
+    debug_log(&opts.logger, format!("Simplification memory estimate: {:.2} GB for {}³ grid", estimated_gb, grid_size));
+    
+    // If estimated memory > 16 GB, skip simplification and use direct brick generation
+    if estimated_gb > 16.0 {
+        opts.logger.log(format!(
+            "⚠ WARNING: Model is too large for simplification ({:.1} GB required).",
+            estimated_gb
+        ));
+        opts.logger.log("Generating bricks directly from octree (1 brick per voxel).".to_string());
+        opts.logger.log("Tip: Use a larger scale value to reduce brick count.".to_string());
+        
+        // Generate bricks directly without VoxelGrid allocation
+        simplify_direct::generate_bricks_direct(octree, &mut save_data, opts);
     } else {
-        opts.logger.log("Simplifying... (please wait, this can take 5-10 minutes for complex models)".to_string());
-    }
+        set_progress(opts, 60, "Simplifying... (this may take 5-10 minutes for complex models)");
+        if let Some(id) = material_id {
+            opts.logger.log(format!("Simplifying material {}... (please wait, this can take several minutes)", id));
+        } else {
+            opts.logger.log("Simplifying... (please wait, this can take 5-10 minutes for complex models)".to_string());
+        }
 
-    debug_log(&opts.logger, format!("Simplify mode: {}", if opts.simplify { "lossy" } else { "lossless" }));
-    debug_log(&opts.logger, format!("Max merge: {}", max_merge));
-    
-    let start = std::time::Instant::now();
-    if opts.simplify {
-        simplify_lossy(octree, &mut save_data, opts, max_merge);
-    } else {
-        simplify_lossless(octree, &mut save_data, opts, max_merge);
+        debug_log(&opts.logger, format!("Simplify mode: {}", if opts.simplify { "lossy" } else { "lossless" }));
+        debug_log(&opts.logger, format!("Max merge: {}", max_merge));
+        
+        let start = std::time::Instant::now();
+        if opts.simplify {
+            simplify_lossy(octree, &mut save_data, opts, max_merge);
+        } else {
+            simplify_lossless(octree, &mut save_data, opts, max_merge);
+        }
+        let elapsed = start.elapsed();
+        
+        debug_log(&opts.logger, format!("Simplification completed in {:.2?}", elapsed));
     }
-    let elapsed = start.elapsed();
-    
-    debug_log(&opts.logger, format!("Simplification completed in {:.2?}", elapsed));
     debug_log(&opts.logger, format!("Generated {} bricks", save_data.bricks.len()));
     debug_log(&opts.logger, format!("Using {} colors", save_data.colors.len()));
+
+    // Add origin marker if enabled
+    if opts.show_origin_marker {
+        add_origin_marker(&mut save_data, opts);
+        opts.logger.log("Added origin marker with XYZ axis indicators.".to_string());
+    }
 
     // Write file
     set_progress(opts, 85, &format!("Writing {} bricks...", save_data.bricks.len()));
@@ -1589,6 +2233,85 @@ fn write_brz_with_grids(opts: &Obj2Brs, grids: Vec<(Entity, Vec<Brick>)>) -> Con
 
     opts.logger.log(format!("Save written to: {:?}", output_file_path));
     Ok(())
+}
+
+/// Add origin marker bricks with color-coded XYZ axis indicators.
+/// - White brick at origin (0,0,0)
+/// - Red bricks along +X axis
+/// - Green bricks along +Y axis  
+/// - Blue bricks along +Z axis
+fn add_origin_marker(save_data: &mut SaveData, opts: &Obj2Brs) {
+    use brdb::{Brick, BrickSize, BrickType as BrdbBrickType, Color, Direction, Position, Rotation};
+
+    // Determine brick size based on brick type
+    let (brick_size, unit_size) = if opts.bricktype == BrickType::Microbricks {
+        let s = opts.brick_scale as u16;
+        (BrickSize::new(s, s, s), opts.brick_scale as i32 * 2)
+    } else {
+        // Default/Tiles use 5x5x2 units
+        (BrickSize::new(5, 5, 2), 10)
+    };
+
+    let asset_name = if opts.bricktype == BrickType::Microbricks {
+        "PB_DefaultMicroBrick"
+    } else if opts.bricktype == BrickType::Tiles {
+        "PB_DefaultTile"
+    } else {
+        "PB_DefaultBrick"
+    };
+
+    let brick_type = BrdbBrickType::from((asset_name, brick_size));
+
+    let material_name = match opts.material {
+        Material::Plastic => "BMC_Plastic",
+        Material::Glass => "BMC_Glass",
+        Material::Glow => "BMC_Glow",
+        Material::Metallic => "BMC_Metallic",
+        Material::Hologram => "BMC_Hologram",
+        Material::Ghost => "BMC_Ghost",
+    };
+
+    // Colors: White (origin), Red (+X), Green (+Y), Blue (+Z)
+    let white = Color::new(255, 255, 255);
+    let red = Color::new(255, 0, 0);
+    let green = Color::new(0, 255, 0);
+    let blue = Color::new(0, 0, 255);
+
+    // Helper to create a marker brick
+    let mut create_marker = |x: i32, y: i32, z: i32, color: Color| -> Brick {
+        Brick {
+            id: None,
+            asset: brick_type.clone(),
+            owner_index: None,
+            position: Position::new(x, y, z),
+            rotation: Rotation::Deg0,
+            direction: Direction::ZPositive,
+            collision: Default::default(),
+            visible: true,
+            color,
+            material: material_name.into(),
+            material_intensity: opts.material_intensity as u8,
+            components: Vec::new(),
+        }
+    };
+
+    // Origin brick (white) at center
+    save_data.bricks.push(create_marker(0, 0, unit_size / 2, white));
+
+    // +X axis (red) - 5 bricks extending right
+    for i in 1..=5 {
+        save_data.bricks.push(create_marker(i * unit_size, 0, unit_size / 2, red));
+    }
+
+    // +Y axis (green) - 5 bricks extending forward
+    for i in 1..=5 {
+        save_data.bricks.push(create_marker(0, i * unit_size, unit_size / 2, green));
+    }
+
+    // +Z axis (blue) - 5 bricks extending up
+    for i in 1..=5 {
+        save_data.bricks.push(create_marker(0, 0, unit_size / 2 + i * unit_size, blue));
+    }
 }
 
 fn main() {
