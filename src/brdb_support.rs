@@ -61,13 +61,26 @@ pub fn write_brz_grids(
     world.meta.bundle.authors = vec![opts.save_owner_name.clone()];
     world.meta.bundle.description = "Converted with obj2brz (split by material)".to_string();
 
-    // Add each material's bricks as a separate frozen grid
-    let total_bricks: usize = grids.iter().map(|(_, bricks)| bricks.len()).sum();
+    // Add all bricks directly to world.bricks instead of using frozen grids
+    // Frozen grids have rendering issues in Brickadia - bricks don't appear
+    // The Entity location offset is applied directly to brick positions
+    let mut total_bricks = 0usize;
     for (entity, bricks) in grids {
-        world.add_brick_grid(entity, bricks);
+        let offset_x = entity.location.x as i32;
+        let offset_y = entity.location.y as i32;
+        let offset_z = entity.location.z as i32;
+        
+        for mut brick in bricks {
+            // Apply entity location offset to brick position
+            brick.position.x += offset_x;
+            brick.position.y += offset_y;
+            brick.position.z += offset_z;
+            world.bricks.push(brick);
+            total_bricks += 1;
+        }
     }
 
-    // Update material intensity for all bricks on main grid (should be empty but just in case)
+    // Update material intensity for all bricks
     for brick in &mut world.bricks {
         brick.material_intensity = opts.material_intensity as u8;
     }
@@ -76,7 +89,7 @@ pub fn write_brz_grids(
 
     match world.write_brz(&path) {
         Ok(_) => {
-            opts.logger.log(format!("Successfully wrote BRZ with multiple grids to {}", path.display()));
+            opts.logger.log(format!("Successfully wrote BRZ to {}", path.display()));
             Ok(())
         }
         Err(e) => Err(ConversionError::SaveWriteError(format!("Failed to write BRZ file: {:?}", e))),

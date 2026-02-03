@@ -1,6 +1,8 @@
 mod barycentric;
 mod brdb_support;
+mod brick_index;
 mod color;
+mod color_merge;
 mod error;
 mod gui;
 mod icon;
@@ -140,6 +142,12 @@ pub struct Obj2Brs {
     /// instead of one grid per texture. Can reduce 300+ grids to ~6 grids in some instances.
     #[serde(default)]
     group_by_brick_material: bool,
+    /// Use smooth bricks without studs for a polished finish
+    #[serde(default)]
+    use_smooth_bricks: bool,
+    /// Color merge threshold for combining similar colored blocks (0.0 = off, 0.1-1.0 = sensitivity)
+    #[serde(default)]
+    color_merge_threshold: f32,
     #[serde(skip)]
     missing_resources_dialog: Option<String>,
     #[serde(skip)]
@@ -292,6 +300,8 @@ impl Default for Obj2Brs {
             scale_z: 1.0,
             use_material_mapping: false,
             group_by_brick_material: false,
+            use_smooth_bricks: false,
+            color_merge_threshold: 0.0,
             missing_resources_dialog: None,
             pending_conversion_skip_textures: false,
             logger: Logger::default(),
@@ -341,19 +351,53 @@ impl App for Obj2Brs {
             .min_height(100.0)
             .default_height(ctx.screen_rect().height() / 4.0)
             .show(ctx, |ui| {
+                // Voxelize button (centered above progress bar)
+                ui.add_space(5.);
+                ui.horizontal(|ui| {
+                    let available_width = ui.available_width();
+                    ui.add_space((available_width - 60.0) / 2.0);
+                    if gui::button(ui, "Voxelize", can_convert && !self.conversion_in_progress) {
+                        self.do_conversion()
+                    }
+                });
+                ui.add_space(5.);
+                
                 // Progress bar (shown during conversion)
                 if self.conversion_in_progress {
                     let progress = self.conversion_progress.load(std::sync::atomic::Ordering::Relaxed) as f32 / 100.0;
                     let stage = self.conversion_stage.lock().map(|s| s.clone()).unwrap_or_default();
                     
+                    // Calculate elapsed time
+                    let elapsed_text = if let Some(start_time) = self.conversion_start_time {
+                        let elapsed = start_time.elapsed();
+                        let seconds = elapsed.as_secs();
+                        if seconds < 60 {
+                            format!("{}s", seconds)
+                        } else {
+                            let minutes = seconds / 60;
+                            let secs = seconds % 60;
+                            format!("{}m {}s", minutes, secs)
+                        }
+                    } else {
+                        "0s".to_string()
+                    };
+                    
+                    // Status bar with Converting label, elapsed time, and Cancel button
+                    ui.horizontal(|ui| {
+                        ui.add_enabled(false, egui::Button::new("Converting..."));
+                        ui.label(RichText::new(elapsed_text).color(egui::Color32::GRAY).monospace());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Cancel").clicked() {
+                                self.conversion_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                                self.logger.log("Cancellation requested...".to_string());
+                            }
+                        });
+                    });
+                    
                     ui.horizontal(|ui| {
                         ui.add(egui::ProgressBar::new(progress)
                             .show_percentage()
                             .animate(true));
-                        if ui.button("Cancel").clicked() {
-                            self.conversion_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-                            self.logger.log("Cancellation requested...".to_string());
-                        }
                     });
                     if !stage.is_empty() {
                         ui.label(RichText::new(&stage).color(egui::Color32::YELLOW));
@@ -421,44 +465,6 @@ impl App for Obj2Brs {
                         self.cache_options(ui);
                     });
 
-                ui.add_space(10.);
-                ui.horizontal(|ui| {
-                    let available_width = ui.available_width();
-                    if self.conversion_in_progress {
-                        // Calculate elapsed time
-                        let elapsed_text = if let Some(start_time) = self.conversion_start_time {
-                            let elapsed = start_time.elapsed();
-                            let seconds = elapsed.as_secs();
-                            if seconds < 60 {
-                                format!("{}s", seconds)
-                            } else {
-                                let minutes = seconds / 60;
-                                let secs = seconds % 60;
-                                format!("{}m {}s", minutes, secs)
-                            }
-                        } else {
-                            "0s".to_string()
-                        };
-                        
-                        // Show Converting + Elapsed Time + Cancel buttons centered
-                        // Fixed width layout to prevent bouncing: Converting(100) + Time(60) + Cancel(60) = 220
-                        ui.add_space((available_width - 220.0) / 2.0);
-                        ui.add_enabled(false, egui::Button::new("Converting..."));
-                        ui.add_space(5.0);
-                        ui.label(RichText::new(elapsed_text).color(egui::Color32::GRAY).monospace());
-                        ui.add_space(5.0);
-                        if ui.button("Cancel").clicked() {
-                            self.conversion_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-                            self.logger.log("Cancellation requested...".to_string());
-                        }
-                    } else {
-                        // Show Voxelize button centered
-                        ui.add_space((available_width - 60.0) / 2.0);
-                        if gui::button(ui, "Voxelize", can_convert) {
-                            self.do_conversion()
-                        }
-                    }
-                });
                 ui.add_space(10.);
             });
 
@@ -709,6 +715,47 @@ impl Obj2Brs {
             ui.add(Checkbox::new(&mut self.simplify, "Simplify (reduces brickcount)"));
             ui.label(RichText::new("(Expensive)").small().color(egui::Color32::from_rgb(255, 180, 0)));
         });
+        ui.end_row();
+
+        ui.label("Brick Surface").on_hover_text(
+            "Choose between studded or smooth brick surfaces.\n\n\
+            Studded: Traditional LEGO-style bricks with visible studs on top.\n\
+            Smooth: Flat surfaces without studs for a polished, clean finish.\n\n\
+            Smooth bricks are ideal for architectural models and clean surfaces.");
+        ui.add(Checkbox::new(&mut self.use_smooth_bricks, "Use smooth bricks (no studs)"));
+        ui.end_row();
+
+        ui.label("Color Merge").on_hover_text(
+            "Merge adjacent bricks with similar colors to reduce brick count.\n\n\
+            Uses Delta E color difference for perceptual accuracy:\n\
+            • Off: No merging\n\
+            • Noticeable (1-2): Perceptible under close scrutiny\n\
+            • Obvious (2-10): Visible at a glance\n\
+            • Distinct (11-49): Clearly different, still similar\n\
+            • Very Different (50-70): Major hue/lightness shifts\n\n\
+            Only merges touching bricks within the same material group.");
+        
+        let current_label = if self.color_merge_threshold == 0.0 {
+            "Off"
+        } else if self.color_merge_threshold <= 2.0 {
+            "Noticeable (1-2)"
+        } else if self.color_merge_threshold <= 10.0 {
+            "Obvious (2-10)"
+        } else if self.color_merge_threshold <= 49.0 {
+            "Distinct (11-49)"
+        } else {
+            "Very Different (50-70)"
+        };
+        
+        egui::ComboBox::from_id_source("color_merge_combo")
+            .selected_text(current_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.color_merge_threshold, 0.0, "Off");
+                ui.selectable_value(&mut self.color_merge_threshold, 1.5, "Noticeable (1-2)");
+                ui.selectable_value(&mut self.color_merge_threshold, 6.0, "Obvious (2-10)");
+                ui.selectable_value(&mut self.color_merge_threshold, 30.0, "Distinct (11-49)");
+                ui.selectable_value(&mut self.color_merge_threshold, 60.0, "Very Different (50-70)");
+            });
         ui.end_row();
 
         ui.label("Scale")
@@ -1409,6 +1456,8 @@ impl Obj2Brs {
         let scale_z = self.scale_z;
         let use_material_mapping = self.use_material_mapping;
         let group_by_brick_material = self.group_by_brick_material;
+        let use_smooth_bricks = self.use_smooth_bricks;
+        let color_merge_threshold = self.color_merge_threshold;
         let detected_game_source = self.detected_game_source;
         let match_brickadia_colorset = self.match_brickadia_colorset;
         let color_mode = self.color_mode;
@@ -1546,6 +1595,8 @@ impl Obj2Brs {
                 scale_z,
                 use_material_mapping,
                 group_by_brick_material,
+                use_smooth_bricks,
+                color_merge_threshold,
                 missing_resources_dialog: None,
                 pending_conversion_skip_textures: false,
                 logger: logger.clone(),
@@ -1617,6 +1668,8 @@ impl Obj2Brs {
         let scale_z = self.scale_z;
         let use_material_mapping = self.use_material_mapping;
         let group_by_brick_material = self.group_by_brick_material;
+        let use_smooth_bricks = self.use_smooth_bricks;
+        let color_merge_threshold = self.color_merge_threshold;
         let bsp_game_source = self.bsp_game_source;
         let detected_game_source = self.detected_game_source;
         let match_brickadia_colorset = self.match_brickadia_colorset;
@@ -1661,6 +1714,8 @@ impl Obj2Brs {
                 scale_z,
                 use_material_mapping,
                 group_by_brick_material,
+                use_smooth_bricks,
+                color_merge_threshold,
                 missing_resources_dialog: None,
                 pending_conversion_skip_textures: false,
                 logger: logger.clone(),
@@ -1837,6 +1892,32 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
         return Ok(());
     }
     
+    // Log conversion settings for debugging
+    opts.logger.log("=== CONVERSION SETTINGS ===".to_string());
+    opts.logger.log(format!("Scale: {}", opts.scale));
+    opts.logger.log(format!("Brick Scale: {}", opts.brick_scale));
+    opts.logger.log(format!("Brick Type: {:?}", opts.bricktype));
+    opts.logger.log(format!("Material: {:?} (Intensity: {})", opts.material, opts.material_intensity));
+    opts.logger.log(format!("Color Mode: {:?}", opts.color_mode));
+    opts.logger.log(format!("Match Brickadia Colorset: {}", opts.match_brickadia_colorset));
+    opts.logger.log(format!("Simplify: {}", opts.simplify));
+    opts.logger.log(format!("Use Smooth Bricks: {}", opts.use_smooth_bricks));
+    opts.logger.log(format!("Color Merge Threshold: {}", opts.color_merge_threshold));
+    opts.logger.log(format!("Axis Scale: X={}, Y={}, Z={}", opts.scale_x, opts.scale_y, opts.scale_z));
+    opts.logger.log(format!("Rotation: X={}°, Y={}°, Z={}°", opts.rotation_x, opts.rotation_y, opts.rotation_z));
+    opts.logger.log(format!("Show Origin Marker: {}", opts.show_origin_marker));
+    opts.logger.log(format!("Skip Textures: {}", skip_textures));
+    
+    // Log experimental material processing settings
+    opts.logger.log(format!("Split by Material: {}", opts.split_by_material));
+    if opts.split_by_material {
+        opts.logger.log(format!("  - Use Material Mapping: {}", opts.use_material_mapping));
+        opts.logger.log(format!("  - Group by Brick Material: {}", opts.group_by_brick_material));
+        opts.logger.log(format!("  - Grid Offset: X={}, Y={}, Z={}", opts.grid_offset_x, opts.grid_offset_y, opts.grid_offset_z));
+    }
+    opts.logger.log("===========================".to_string());
+    opts.logger.log("".to_string());
+    
     if opts.split_by_material {
         // Load models and materials once
         set_progress(opts, 5, "Loading models and materials...");
@@ -2008,10 +2089,72 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
             // Brick position formula: scale * size + 2 * scale * pos
             // So offset needs to be multiplied by 2 * scale to match the pos term
             let brick_scale_factor = 2.0 * opts.brick_scale as f32;
+            
+            // Calculate brick position ranges before and after offset
+            let mut min_pos_before = (i32::MAX, i32::MAX, i32::MAX);
+            let mut max_pos_before = (i32::MIN, i32::MIN, i32::MIN);
+            for brick in &save_data.bricks {
+                min_pos_before.0 = min_pos_before.0.min(brick.position.x);
+                min_pos_before.1 = min_pos_before.1.min(brick.position.y);
+                min_pos_before.2 = min_pos_before.2.min(brick.position.z);
+                max_pos_before.0 = max_pos_before.0.max(brick.position.x);
+                max_pos_before.1 = max_pos_before.1.max(brick.position.y);
+                max_pos_before.2 = max_pos_before.2.max(brick.position.z);
+            }
+            
             for brick in &mut save_data.bricks {
                 brick.position.x += (world_offset.x * brick_scale_factor) as i32;
                 brick.position.y += (world_offset.y * brick_scale_factor) as i32;
                 brick.position.z += (world_offset.z * brick_scale_factor) as i32;
+            }
+            
+            // Calculate brick position ranges after world offset
+            let mut min_pos_after = (i32::MAX, i32::MAX, i32::MAX);
+            let mut max_pos_after = (i32::MIN, i32::MIN, i32::MIN);
+            for brick in &save_data.bricks {
+                min_pos_after.0 = min_pos_after.0.min(brick.position.x);
+                min_pos_after.1 = min_pos_after.1.min(brick.position.y);
+                min_pos_after.2 = min_pos_after.2.min(brick.position.z);
+                max_pos_after.0 = max_pos_after.0.max(brick.position.x);
+                max_pos_after.1 = max_pos_after.1.max(brick.position.y);
+                max_pos_after.2 = max_pos_after.2.max(brick.position.z);
+            }
+            
+            if crate::DEBUG_MODE && !save_data.bricks.is_empty() {
+                debug_log(&opts.logger, format!("Brick positions before offset: X[{},{}] Y[{},{}] Z[{},{}]",
+                    min_pos_before.0, max_pos_before.0, min_pos_before.1, max_pos_before.1, min_pos_before.2, max_pos_before.2));
+                debug_log(&opts.logger, format!("Brick positions after world offset: X[{},{}] Y[{},{}] Z[{},{}]",
+                    min_pos_after.0, max_pos_after.0, min_pos_after.1, max_pos_after.1, min_pos_after.2, max_pos_after.2));
+            }
+            
+            // Auto-correct negative brick positions by shifting all bricks to positive space
+            // Brickadia frozen grids don't render bricks at negative local positions correctly
+            if !save_data.bricks.is_empty() {
+                let correction_x = if min_pos_after.0 < 0 { -min_pos_after.0 } else { 0 };
+                let correction_y = if min_pos_after.1 < 0 { -min_pos_after.1 } else { 0 };
+                let correction_z = if min_pos_after.2 < 0 { -min_pos_after.2 } else { 0 };
+                
+                if correction_x > 0 || correction_y > 0 || correction_z > 0 {
+                    debug_log(&opts.logger, format!("Auto-correcting negative positions: shifting by ({}, {}, {})",
+                        correction_x, correction_y, correction_z));
+                    
+                    for brick in &mut save_data.bricks {
+                        brick.position.x += correction_x;
+                        brick.position.y += correction_y;
+                        brick.position.z += correction_z;
+                    }
+                    
+                    // Update min/max after correction
+                    min_pos_after.0 += correction_x;
+                    max_pos_after.0 += correction_x;
+                    min_pos_after.1 += correction_y;
+                    max_pos_after.1 += correction_y;
+                    min_pos_after.2 += correction_z;
+                    max_pos_after.2 += correction_z;
+                    
+                    debug_log(&opts.logger, format!("Brick positions after auto-correction: X[{},{}] Y[{},{}] Z[{},{}]",
+                        min_pos_after.0, max_pos_after.0, min_pos_after.1, max_pos_after.1, min_pos_after.2, max_pos_after.2));
+                }
             }
 
             let mat_elapsed = mat_start.elapsed();
@@ -2028,14 +2171,22 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
                 opts.logger.log(format!("Material {} ({}, {} tris) -> {} bricks as {:?} in {:.2}s", 
                     mat_id, mat_name, triangle_count, save_data.bricks.len(), brick_material, mat_elapsed.as_secs_f32()));
 
+                // Brick positions are kept as world coordinates
+                // Entity location is used as an additional offset (for separating multiple material grids)
+                // The write_brz_grids function will combine entity location + brick position
+                
                 if opts.group_by_brick_material {
                     // Consolidate bricks by Brickadia material type
                     bricks_by_type.entry(brick_material).or_default().extend(save_data.bricks);
                 } else {
                     // One grid per texture material (original behavior)
-                    let offset_multiplier = mat_id as f32;
+                    // Only apply offset multiplier if user has set a non-zero grid offset
+                    // Otherwise keep all materials at origin so they stay aligned
+                    let has_offset = opts.grid_offset_x != 0.0 || opts.grid_offset_y != 0.0 || opts.grid_offset_z != 0.0;
+                    let offset_multiplier = if has_offset { mat_id as f32 } else { 0.0 };
+                    
                     let entity = Entity {
-                        frozen: true,
+                        frozen: false,
                         location: brdb::Vector3f {
                             x: opts.grid_offset_x * offset_multiplier,
                             y: opts.grid_offset_y * offset_multiplier,
@@ -2055,9 +2206,12 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
         if opts.group_by_brick_material {
             let mut type_index = 0;
             for (brick_material, bricks) in bricks_by_type {
+                // Brick positions are already in world coordinates
+                // Entity location provides optional offset for separating material types
                 opts.logger.log(format!("Grid {:?} -> {} bricks", brick_material, bricks.len()));
+                
                 let entity = Entity {
-                    frozen: true,
+                    frozen: false,
                     location: brdb::Vector3f {
                         x: opts.grid_offset_x * type_index as f32,
                         y: opts.grid_offset_y * type_index as f32,
@@ -2083,6 +2237,17 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
             } else {
                 opts.logger.log(format!("Saved material cache ({} entries)", mapping.cache_size()));
             }
+        }
+
+        // Add origin marker if enabled
+        if opts.show_origin_marker {
+            let marker_bricks = create_origin_marker_bricks(opts);
+            let marker_entity = Entity {
+                frozen: false,
+                location: brdb::Vector3f { x: 0.0, y: 0.0, z: 0.0 },
+                ..Default::default()
+            };
+            material_grids.push((marker_entity, marker_bricks));
         }
 
         set_progress(opts, 90, "Writing BRZ file...");
@@ -2650,11 +2815,15 @@ fn write_brz_data(octree: &mut octree::VoxelTree<Vector4<u8>>, opts: &Obj2Brs, m
     // Add origin marker if enabled
     if opts.show_origin_marker {
         add_origin_marker(&mut save_data, opts);
-        opts.logger.log("Added origin marker with XYZ axis indicators.".to_string());
     }
 
-    // Write file
-    set_progress(opts, 85, &format!("Writing {} bricks...", save_data.bricks.len()));
+    // Apply color merging if enabled
+    if opts.color_merge_threshold > 0.0 {
+        set_progress(opts, 92, "Merging similar colors...");
+        color_merge::merge_similar_colors(&mut save_data, opts.color_merge_threshold, &opts.logger);
+    }
+
+    set_progress(opts, 95, "Writing file...");
     opts.logger.log(format!("Writing {} bricks...", save_data.bricks.len()));
 
     let preview = image::load_from_memory_with_format(OBJ_ICON, image::ImageFormat::Png)
@@ -2684,8 +2853,27 @@ fn write_brz_data(octree: &mut octree::VoxelTree<Vector4<u8>>, opts: &Obj2Brs, m
     Ok(())
 }
 
-fn write_brz_with_grids(opts: &Obj2Brs, grids: Vec<(Entity, Vec<Brick>)>) -> ConversionResult<()> {
+fn write_brz_with_grids(opts: &Obj2Brs, mut grids: Vec<(Entity, Vec<Brick>)>) -> ConversionResult<()> {
     opts.logger.log(format!("Writing {} frozen grids...", grids.len()));
+
+    // Apply color merging to each grid if enabled
+    if opts.color_merge_threshold > 0.0 {
+        set_progress(opts, 92, "Merging similar colors across grids...");
+        let grid_count = grids.len();
+        for (idx, (_, bricks)) in grids.iter_mut().enumerate() {
+            let mut save_data = SaveData {
+                bricks: std::mem::take(bricks),
+                colors: palette::DEFAULT_PALETTE.to_vec(),
+                author_name: opts.save_owner_name.clone(),
+            };
+            color_merge::merge_similar_colors(&mut save_data, opts.color_merge_threshold, &opts.logger);
+            *bricks = save_data.bricks;
+            
+            if (idx + 1) % 10 == 0 {
+                opts.logger.log(format!("Processed {}/{} grids for color merging", idx + 1, grid_count));
+            }
+        }
+    }
 
     let preview = image::load_from_memory_with_format(OBJ_ICON, image::ImageFormat::Png)
         .map_err(|e| ConversionError::SaveWriteError(format!("Failed to load preview icon: {}", e)))?;
@@ -2729,8 +2917,8 @@ fn add_origin_marker(save_data: &mut SaveData, opts: &Obj2Brs) {
 
     let asset_name = if opts.bricktype == BrickType::Microbricks {
         "PB_DefaultMicroBrick"
-    } else if opts.bricktype == BrickType::Tiles {
-        "PB_DefaultTile"
+    } else if opts.bricktype == BrickType::Tiles || opts.use_smooth_bricks {
+        "PB_DefaultSmoothTile"
     } else {
         "PB_DefaultBrick"
     };
@@ -2787,6 +2975,85 @@ fn add_origin_marker(save_data: &mut SaveData, opts: &Obj2Brs) {
     for i in 1..=5 {
         save_data.bricks.push(create_marker(0, 0, unit_size / 2 + i * unit_size, blue));
     }
+}
+
+/// Create origin marker bricks and return them as a Vec (for split-by-material path)
+fn create_origin_marker_bricks(opts: &Obj2Brs) -> Vec<Brick> {
+    use brdb::{Brick, BrickSize, BrickType as BrdbBrickType, Color, Direction, Position, Rotation};
+
+    let mut bricks = Vec::new();
+
+    // Determine brick size based on brick type
+    let (brick_size, unit_size) = if opts.bricktype == BrickType::Microbricks {
+        let s = opts.brick_scale as u16;
+        (BrickSize::new(s, s, s), opts.brick_scale as i32 * 2)
+    } else {
+        // Default/Tiles use 5x5x2 units
+        (BrickSize::new(5, 5, 2), 10)
+    };
+
+    let asset_name = if opts.bricktype == BrickType::Microbricks {
+        "PB_DefaultMicroBrick"
+    } else if opts.bricktype == BrickType::Tiles || opts.use_smooth_bricks {
+        "PB_DefaultSmoothTile"
+    } else {
+        "PB_DefaultBrick"
+    };
+
+    let brick_type = BrdbBrickType::from((asset_name, brick_size));
+
+    let material_name = match opts.material {
+        Material::Plastic => "BMC_Plastic",
+        Material::Glass => "BMC_Glass",
+        Material::Glow => "BMC_Glow",
+        Material::Metallic => "BMC_Metallic",
+        Material::Hologram => "BMC_Hologram",
+        Material::Ghost => "BMC_Ghost",
+    };
+
+    // Colors: White (origin), Red (+X), Green (+Y), Blue (+Z)
+    let white = Color::new(255, 255, 255);
+    let red = Color::new(255, 0, 0);
+    let green = Color::new(0, 255, 0);
+    let blue = Color::new(0, 0, 255);
+
+    // Helper to create a marker brick
+    let create_marker = |x: i32, y: i32, z: i32, color: Color| -> Brick {
+        Brick {
+            id: None,
+            asset: brick_type.clone(),
+            owner_index: None,
+            position: Position::new(x, y, z),
+            rotation: Rotation::Deg0,
+            direction: Direction::ZPositive,
+            collision: Default::default(),
+            visible: true,
+            color,
+            material: material_name.into(),
+            material_intensity: opts.material_intensity as u8,
+            components: Vec::new(),
+        }
+    };
+
+    // Origin brick (white) at center
+    bricks.push(create_marker(0, 0, unit_size / 2, white));
+
+    // +X axis (red) - 5 bricks extending right
+    for i in 1..=5 {
+        bricks.push(create_marker(i * unit_size, 0, unit_size / 2, red));
+    }
+
+    // +Y axis (green) - 5 bricks extending forward
+    for i in 1..=5 {
+        bricks.push(create_marker(0, i * unit_size, unit_size / 2, green));
+    }
+
+    // +Z axis (blue) - 5 bricks extending up
+    for i in 1..=5 {
+        bricks.push(create_marker(0, 0, unit_size / 2 + i * unit_size, blue));
+    }
+
+    bricks
 }
 
 fn main() {

@@ -60,8 +60,15 @@ impl VoxelGrid {
         }
         if crate::DEBUG_MODE {
             logger.log(format!("[DEBUG] Extracted {} voxels from octree (size {})", count, octree.size));
-            logger.log(format!("[DEBUG] Voxel coordinate ranges: X[{},{}] Y[{},{}] Z[{},{}]", 
+            logger.log(format!("[DEBUG] Voxel coordinate ranges (local): X[{},{}] Y[{},{}] Z[{},{}]", 
                 min_x, max_x, min_y, max_y, min_z, max_z));
+            
+            // Warn if negative coordinates detected (blocks will be at negative positions)
+            if min_x < 0 || min_y < 0 || min_z < 0 {
+                logger.log(format!("[WARNING] Negative voxel coordinates detected! Blocks may be placed at negative positions."));
+                logger.log(format!("[WARNING] This can cause issues when 'Split by Material' is enabled."));
+                logger.log(format!("[WARNING] Consider adjusting Grid Offset settings to ensure positive placement."));
+            }
         }
         
         Self { data, size, offset }
@@ -259,13 +266,31 @@ pub fn simplify_lossy(
         let height = yp - y;
         let depth = zp - z;
 
-        save_data.bricks.push(create_brick(
+        // Check if this brick has a top surface (no voxels directly above it)
+        // A brick is a top surface if there's no voxel at z=zp for any (x,y) in the brick's footprint
+        let is_top_surface = if opts.use_smooth_bricks {
+            let mut has_voxel_above = false;
+            'top_check: for sx in x..xp {
+                for sy in y..yp {
+                    if grid.get(sx, sy, zp).is_some() {
+                        has_voxel_above = true;
+                        break 'top_check;
+                    }
+                }
+            }
+            !has_voxel_above
+        } else {
+            false
+        };
+
+        save_data.bricks.push(create_brick_with_surface(
             opts,
             &save_data.colors,
             scales,
             (width, depth, height),
             (x, z, y),
             color,
+            is_top_surface,
         ));
     }
 }
@@ -393,17 +418,35 @@ pub fn simplify_lossless(
             unmatched_color
         };
 
-        save_data.bricks.push(create_brick(
+        // Check if this brick has a top surface (no voxels directly above it)
+        let is_top_surface = if opts.use_smooth_bricks {
+            let mut has_voxel_above = false;
+            'top_check: for sx in x..xp {
+                for sy in y..yp {
+                    if grid.get(sx, sy, zp).is_some() {
+                        has_voxel_above = true;
+                        break 'top_check;
+                    }
+                }
+            }
+            !has_voxel_above
+        } else {
+            false
+        };
+
+        save_data.bricks.push(create_brick_with_surface(
             opts,
             &save_data.colors,
             scales,
             (width, depth, height),
             (x, z, y),
             color,
+            is_top_surface,
         ));
     }
 }
 
+#[allow(dead_code)]
 fn create_brick(
     opts: &Obj2Brs,
     palette: &[Color],
@@ -411,6 +454,36 @@ fn create_brick(
     size: (isize, isize, isize),
     pos: (isize, isize, isize),
     color: BrickColor,
+) -> Brick {
+    // For smooth bricks option, we apply smooth to all bricks in this default path
+    // The is_top_surface variant is used when we need selective smoothing
+    create_brick_internal(opts, palette, scale, size, pos, color, opts.use_smooth_bricks)
+}
+
+/// Create a brick with explicit control over whether it should be smooth.
+/// is_top_surface: when true and use_smooth_bricks is enabled, uses smooth tile instead of studded brick
+fn create_brick_with_surface(
+    opts: &Obj2Brs,
+    palette: &[Color],
+    scale: (isize, isize, isize),
+    size: (isize, isize, isize),
+    pos: (isize, isize, isize),
+    color: BrickColor,
+    is_top_surface: bool,
+) -> Brick {
+    // Only apply smooth if both the option is enabled AND this is a top surface
+    let apply_smooth = opts.use_smooth_bricks && is_top_surface;
+    create_brick_internal(opts, palette, scale, size, pos, color, apply_smooth)
+}
+
+fn create_brick_internal(
+    opts: &Obj2Brs,
+    palette: &[Color],
+    scale: (isize, isize, isize),
+    size: (isize, isize, isize),
+    pos: (isize, isize, isize),
+    color: BrickColor,
+    apply_smooth: bool,
 ) -> Brick {
     let brick_size = BrickSize::new(
         (scale.0 * size.0) as u16,
@@ -426,8 +499,8 @@ fn create_brick(
 
     let asset_name = if opts.bricktype == BrickType::Microbricks {
         "PB_DefaultMicroBrick"
-    } else if opts.bricktype == BrickType::Tiles {
-        "PB_DefaultTile"
+    } else if opts.bricktype == BrickType::Tiles || apply_smooth {
+        "PB_DefaultSmoothTile"
     } else {
         "PB_DefaultBrick"
     };
@@ -469,6 +542,7 @@ fn create_brick(
 }
 
 /// Create a brick with a specific material and intensity override (for material mapping).
+#[allow(dead_code)]
 fn create_brick_with_material(
     opts: &Obj2Brs,
     palette: &[Color],
@@ -478,6 +552,36 @@ fn create_brick_with_material(
     color: BrickColor,
     material: Material,
     intensity: u8,
+) -> Brick {
+    create_brick_with_material_internal(opts, palette, scale, size, pos, color, material, intensity, opts.use_smooth_bricks)
+}
+
+/// Create a brick with material override and explicit surface control.
+fn create_brick_with_material_and_surface(
+    opts: &Obj2Brs,
+    palette: &[Color],
+    scale: (isize, isize, isize),
+    size: (isize, isize, isize),
+    pos: (isize, isize, isize),
+    color: BrickColor,
+    material: Material,
+    intensity: u8,
+    is_top_surface: bool,
+) -> Brick {
+    let apply_smooth = opts.use_smooth_bricks && is_top_surface;
+    create_brick_with_material_internal(opts, palette, scale, size, pos, color, material, intensity, apply_smooth)
+}
+
+fn create_brick_with_material_internal(
+    opts: &Obj2Brs,
+    palette: &[Color],
+    scale: (isize, isize, isize),
+    size: (isize, isize, isize),
+    pos: (isize, isize, isize),
+    color: BrickColor,
+    material: Material,
+    intensity: u8,
+    apply_smooth: bool,
 ) -> Brick {
     let brick_size = BrickSize::new(
         (scale.0 * size.0) as u16,
@@ -493,8 +597,8 @@ fn create_brick_with_material(
 
     let asset_name = if opts.bricktype == BrickType::Microbricks {
         "PB_DefaultMicroBrick"
-    } else if opts.bricktype == BrickType::Tiles {
-        "PB_DefaultTile"
+    } else if opts.bricktype == BrickType::Tiles || apply_smooth {
+        "PB_DefaultSmoothTile"
     } else {
         "PB_DefaultBrick"
     };
@@ -644,7 +748,23 @@ pub fn simplify_lossy_with_material(
         let height = yp - y;
         let depth = zp - z;
 
-        save_data.bricks.push(create_brick_with_material(
+        // Check if this brick has a top surface (no voxels directly above it)
+        let is_top_surface = if opts.use_smooth_bricks {
+            let mut has_voxel_above = false;
+            'top_check: for sx in x..xp {
+                for sy in y..yp {
+                    if grid.get(sx, sy, zp).is_some() {
+                        has_voxel_above = true;
+                        break 'top_check;
+                    }
+                }
+            }
+            !has_voxel_above
+        } else {
+            false
+        };
+
+        save_data.bricks.push(create_brick_with_material_and_surface(
             opts,
             &save_data.colors,
             scales,
@@ -653,6 +773,7 @@ pub fn simplify_lossy_with_material(
             color,
             material,
             intensity,
+            is_top_surface,
         ));
     }
 }
@@ -777,7 +898,23 @@ pub fn simplify_lossless_with_material(
         let height = yp - y;
         let depth = zp - z;
 
-        save_data.bricks.push(create_brick_with_material(
+        // Check if this brick has a top surface (no voxels directly above it)
+        let is_top_surface = if opts.use_smooth_bricks {
+            let mut has_voxel_above = false;
+            'top_check: for sx in x..xp {
+                for sy in y..yp {
+                    if grid.get(sx, sy, zp).is_some() {
+                        has_voxel_above = true;
+                        break 'top_check;
+                    }
+                }
+            }
+            !has_voxel_above
+        } else {
+            false
+        };
+
+        save_data.bricks.push(create_brick_with_material_and_surface(
             opts,
             &save_data.colors,
             scales,
@@ -786,6 +923,7 @@ pub fn simplify_lossless_with_material(
             color,
             material,
             intensity,
+            is_top_surface,
         ));
     }
 }

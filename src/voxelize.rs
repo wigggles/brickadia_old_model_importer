@@ -403,7 +403,7 @@ pub fn voxelize_from_pregrouped(
     
     // Calculate bounds for translated triangles (now starting near origin)
     let size = bounds.max - bounds.min;
-    let floor_min = Vector3::<isize>::new(-1, -1, -1);
+    let floor_min = Vector3::<isize>::new(0, 0, 0);
     let ceil_max = Vector3::<isize>::new(
         size[0].ceil() as isize + 1,
         size[1].ceil() as isize + 1,

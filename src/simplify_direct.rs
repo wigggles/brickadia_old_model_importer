@@ -103,8 +103,8 @@ fn create_brick(
 
     let asset_name = if opts.bricktype == BrickType::Microbricks {
         "PB_DefaultMicroBrick"
-    } else if opts.bricktype == BrickType::Tiles {
-        "PB_DefaultTile"
+    } else if opts.bricktype == BrickType::Tiles || opts.use_smooth_bricks {
+        "PB_DefaultSmoothTile"
     } else {
         "PB_DefaultBrick"
     };
