@@ -93,6 +93,14 @@ impl Logger {
         }
     }
 
+    /// Create a logger without a log file (for temporary use during deserialization)
+    fn new_without_file() -> Self {
+        Self {
+            messages: Arc::new(Mutex::new(Vec::new())),
+            log_file: Arc::new(Mutex::new(None)),
+        }
+    }
+
     fn create_log_file() -> Option<File> {
         let logs_dir = get_logs_dir();
         if create_dir_all(&logs_dir).is_err() {
@@ -154,6 +162,6 @@ impl Logger {
 
 impl Default for Logger {
     fn default() -> Self {
-        Self::new()
+        Self::new_without_file()
     }
 }

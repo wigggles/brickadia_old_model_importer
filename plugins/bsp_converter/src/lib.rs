@@ -107,6 +107,35 @@ impl GameSource {
             GameSource::Auto | GameSource::HalfLife1 | GameSource::Quake1 | GameSource::CallOfDuty1
         )
     }
+
+    /// Get the engine folder name for this game source's textures/config.
+    /// Used for locating game-specific material mapping configs.
+    /// Structure: data/game_textures/<engine>/<game>/
+    pub fn folder_name(&self) -> &'static str {
+        match self {
+            GameSource::Auto => "auto",
+            GameSource::HalfLife1 => "goldsrc",      // GoldSrc engine (Valve)
+            GameSource::Quake1 => "idtech",          // id Tech engine (id Software)
+            GameSource::Quake2 => "idtech",          // id Tech engine (id Software)
+            GameSource::CallOfDuty1 => "iw",         // IW engine (Infinity Ward)
+            GameSource::CallOfDuty2 => "iw",         // IW engine (Infinity Ward)
+            GameSource::MedalOfHonor => "idtech",    // id Tech engine (id Software)
+        }
+    }
+
+    /// Get the game subfolder name for this game source.
+    /// Used with folder_name() to build full path: <engine>/<game>/
+    pub fn game_name(&self) -> &'static str {
+        match self {
+            GameSource::Auto => "auto",
+            GameSource::HalfLife1 => "halflife",
+            GameSource::Quake1 => "quake",
+            GameSource::Quake2 => "quake2",
+            GameSource::CallOfDuty1 => "cod1",
+            GameSource::CallOfDuty2 => "cod2",
+            GameSource::MedalOfHonor => "mohaa",
+        }
+    }
 }
 
 impl std::fmt::Display for GameSource {

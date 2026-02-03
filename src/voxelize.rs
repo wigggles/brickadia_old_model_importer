@@ -1,5 +1,6 @@
 use crate::barycentric::interpolate_uv;
 use crate::color::*;
+use crate::logger::Logger;
 use crate::BrickType;
 use crate::intersect::intersect;
 use crate::octree::{Branches, TreeBody, VoxelTree};
@@ -7,6 +8,7 @@ use crate::octree::{Branches, TreeBody, VoxelTree};
 use cgmath::{Vector2, Vector3, Vector4};
 use image::RgbaImage;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -57,12 +59,142 @@ impl AABB {
 
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
-struct Triangle {
+pub struct Triangle {
     material_id: Option<usize>,
     vertices: [Vector3<f32>; 3],
     uvs: Option<[Vector2<f32>; 3]>,
     /// Pre-computed bounding box for fast rejection
     aabb: AABB,
+}
+
+/// Bounding box for a set of triangles
+#[derive(Debug, Clone, Copy)]
+pub struct MaterialBounds {
+    pub min: Vector3<f32>,
+    pub max: Vector3<f32>,
+}
+
+/// Pre-extracted triangles grouped by material ID for efficient multi-material processing.
+/// This avoids re-parsing models for each material.
+pub struct PreGroupedTriangles {
+    /// Triangles grouped by material ID (None key = no material)
+    pub by_material: HashMap<Option<usize>, Vec<Triangle>>,
+    /// Per-material bounding boxes for efficient octree sizing
+    pub bounds_by_material: HashMap<Option<usize>, MaterialBounds>,
+    /// Global bounding box for all triangles
+    pub global_min: Vector3<f32>,
+    pub global_max: Vector3<f32>,
+    /// Total triangle count
+    pub total_count: usize,
+}
+
+impl PreGroupedTriangles {
+    /// Extract all triangles from models and group them by material ID.
+    /// This is done once, then individual materials can be voxelized efficiently.
+    pub fn from_models(models: &[tobj::Model]) -> Self {
+        let mut by_material: HashMap<Option<usize>, Vec<Triangle>> = HashMap::new();
+        let mut total_count = 0;
+        
+        // Initialize global bounds from first vertex
+        let u = &models[0].mesh.positions;
+        let mut global_min = Vector3::new(u[0], u[1], u[2]);
+        let mut global_max = global_min;
+        
+        // First pass: compute global bounds
+        for m in models.iter() {
+            let p = &m.mesh.positions;
+            for v in (0..p.len()).step_by(3) {
+                for axis in 0..3 {
+                    global_min[axis] = global_min[axis].min(p[v + axis]);
+                    global_max[axis] = global_max[axis].max(p[v + axis]);
+                }
+            }
+        }
+        
+        // Second pass: extract triangles, group by material, and compute per-material bounds
+        let mut bounds_by_material: HashMap<Option<usize>, MaterialBounds> = HashMap::new();
+        
+        for m in models.iter() {
+            let mesh = &m.mesh;
+            let material = mesh.material_id;
+            
+            for n in (0..mesh.indices.len()).step_by(3) {
+                let mut idx = (3 * mesh.indices[n]) as usize;
+                let v0 = Vector3::new(
+                    mesh.positions[idx],
+                    mesh.positions[idx + 1],
+                    mesh.positions[idx + 2],
+                );
+                idx = (3 * mesh.indices[n + 1]) as usize;
+                let v1 = Vector3::new(
+                    mesh.positions[idx],
+                    mesh.positions[idx + 1],
+                    mesh.positions[idx + 2],
+                );
+                idx = (3 * mesh.indices[n + 2]) as usize;
+                let v2 = Vector3::new(
+                    mesh.positions[idx],
+                    mesh.positions[idx + 1],
+                    mesh.positions[idx + 2],
+                );
+                
+                // Update per-material bounds
+                let bounds = bounds_by_material.entry(material).or_insert(MaterialBounds {
+                    min: v0,
+                    max: v0,
+                });
+                for v in [v0, v1, v2] {
+                    bounds.min.x = bounds.min.x.min(v.x);
+                    bounds.min.y = bounds.min.y.min(v.y);
+                    bounds.min.z = bounds.min.z.min(v.z);
+                    bounds.max.x = bounds.max.x.max(v.x);
+                    bounds.max.y = bounds.max.y.max(v.y);
+                    bounds.max.z = bounds.max.z.max(v.z);
+                }
+                
+                let uvs = if !mesh.texcoords.is_empty() {
+                    idx = (2 * mesh.indices[n]) as usize;
+                    let uv0 = Vector2::new(mesh.texcoords[idx], mesh.texcoords[idx + 1]);
+                    idx = (2 * mesh.indices[n + 1]) as usize;
+                    let uv1 = Vector2::new(mesh.texcoords[idx], mesh.texcoords[idx + 1]);
+                    idx = (2 * mesh.indices[n + 2]) as usize;
+                    let uv2 = Vector2::new(mesh.texcoords[idx], mesh.texcoords[idx + 1]);
+                    Some([uv0, uv1, uv2])
+                } else {
+                    None
+                };
+                
+                let aabb = AABB::from_triangle(v0, v1, v2);
+                let triangle = Triangle {
+                    material_id: material,
+                    vertices: [v0, v1, v2],
+                    uvs,
+                    aabb,
+                };
+                
+                by_material.entry(material).or_default().push(triangle);
+                total_count += 1;
+            }
+        }
+        
+        Self {
+            by_material,
+            bounds_by_material,
+            global_min,
+            global_max,
+            total_count,
+        }
+    }
+    
+    /// Get the bounding box for a specific material.
+    pub fn get_material_bounds(&self, material_id: usize) -> Option<&MaterialBounds> {
+        self.bounds_by_material.get(&Some(material_id))
+    }
+    
+    /// Get triangles for a specific material ID.
+    pub fn get_material(&self, material_id: usize) -> Option<&Vec<Triangle>> {
+        self.by_material.get(&Some(material_id))
+    }
 }
 
 /// Progress tracker for voxelization
@@ -92,7 +224,7 @@ pub fn voxelize(
     _bricktype: BrickType,
     material_filter: Option<usize>,
 ) -> VoxelTree<Vector4<u8>> {
-    voxelize_with_progress(models, materials, _scale, _bricktype, material_filter, None)
+    voxelize_with_progress(models, materials, _scale, _bricktype, material_filter, None, None)
 }
 
 pub fn voxelize_with_progress(
@@ -102,6 +234,7 @@ pub fn voxelize_with_progress(
     _bricktype: BrickType,
     material_filter: Option<usize>,
     progress: Option<Arc<VoxelizeProgress>>,
+    logger: Option<&Logger>,
 ) -> VoxelTree<Vector4<u8>> {
     let mut octree = VoxelTree::<Vector4<u8>>::new();
 
@@ -132,11 +265,27 @@ pub fn voxelize_with_progress(
         max[2].ceil() as isize + 1,
     );
 
+    // Debug: log the model bounds before octree sizing
+    if crate::DEBUG_MODE {
+        if let Some(log) = logger {
+            log.log(format!("[DEBUG] Model float bounds: min({:.2},{:.2},{:.2}) max({:.2},{:.2},{:.2})", 
+                min[0], min[1], min[2], max[0], max[1], max[2]));
+            log.log(format!("[DEBUG] Integer bounds: floor_min({},{},{}) ceil_max({},{},{})", 
+                floor_min[0], floor_min[1], floor_min[2], ceil_max[0], ceil_max[1], ceil_max[2]));
+        }
+    }
+
     while !octree.contains_bounds(floor_min) || !octree.contains_bounds(ceil_max) {
         octree.size += 1;
     }
 
     let mask = 1 << octree.size;
+    if crate::DEBUG_MODE {
+        if let Some(log) = logger {
+            log.log(format!("[DEBUG] Octree size: {}, mask: {}, range: [{}, {}]", 
+                octree.size, mask, -(mask as isize), mask as isize));
+        }
+    }
 
     // Voxelize
     let mut triangles = Vec::<Triangle>::new();
@@ -205,6 +354,77 @@ pub fn voxelize_with_progress(
     recursive_voxelize(&mut octree.contents, mask, triangles, materials, octree.size as usize, &progress);
 
     octree
+}
+
+/// Voxelize from pre-grouped triangles for a specific material.
+/// This is much faster when processing multiple materials since triangles are already extracted.
+/// Uses per-material bounds with coordinate translation for efficient octree sizing.
+/// Returns (octree, world_offset) where world_offset is the translation that was applied.
+/// Caller must add world_offset back to brick positions to restore world coordinates.
+pub fn voxelize_from_pregrouped(
+    pregrouped: &PreGroupedTriangles,
+    materials: &[RgbaImage],
+    material_id: usize,
+    progress: Option<Arc<VoxelizeProgress>>,
+    _logger: Option<&Logger>,
+) -> (VoxelTree<Vector4<u8>>, Vector3<f32>) {
+    let mut octree = VoxelTree::<Vector4<u8>>::new();
+    let zero_offset = Vector3::new(0.0, 0.0, 0.0);
+    
+    // Get pre-grouped triangles for this material (already extracted)
+    let original_triangles = match pregrouped.get_material(material_id) {
+        Some(tris) => tris,
+        None => return (octree, zero_offset), // No triangles for this material
+    };
+    
+    // Get per-material bounds for efficient octree sizing
+    let bounds = match pregrouped.get_material_bounds(material_id) {
+        Some(b) => b,
+        None => return (octree, zero_offset),
+    };
+    
+    // Store the offset we're applying (bounds.min) so caller can add it back to bricks
+    let world_offset = bounds.min;
+    
+    // Translate triangles so their bounds start near origin
+    // This allows us to use a small octree sized to just this material's geometry
+    let triangles: Vec<Triangle> = original_triangles.iter().map(|t| {
+        let mut translated = *t;
+        translated.vertices[0] -= bounds.min;
+        translated.vertices[1] -= bounds.min;
+        translated.vertices[2] -= bounds.min;
+        translated.aabb = AABB::from_triangle(
+            translated.vertices[0],
+            translated.vertices[1],
+            translated.vertices[2],
+        );
+        translated
+    }).collect();
+    
+    // Calculate bounds for translated triangles (now starting near origin)
+    let size = bounds.max - bounds.min;
+    let floor_min = Vector3::<isize>::new(-1, -1, -1);
+    let ceil_max = Vector3::<isize>::new(
+        size[0].ceil() as isize + 1,
+        size[1].ceil() as isize + 1,
+        size[2].ceil() as isize + 1,
+    );
+    
+    while !octree.contains_bounds(floor_min) || !octree.contains_bounds(ceil_max) {
+        octree.size += 1;
+    }
+
+    let mask = 1 << octree.size;
+
+    // Set up progress tracking
+    if let Some(ref p) = progress {
+        p.triangles_total.store(triangles.len(), Ordering::Relaxed);
+        p.depth_max.store(octree.size as usize, Ordering::Relaxed);
+    }
+
+    recursive_voxelize(&mut octree.contents, mask, triangles, materials, octree.size as usize, &progress);
+
+    (octree, world_offset)
 }
 
 /// Minimum depth at which to use parallel processing.

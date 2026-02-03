@@ -34,7 +34,7 @@ pub fn write_brz(
 
     match world.write_brz(&path) {
         Ok(_) => {
-            opts.logger.log(format!("Successfully wrote BRZ to {:?}", path));
+            opts.logger.log(format!("Successfully wrote BRZ to {}", path.display()));
             Ok(())
         }
         Err(e) => Err(ConversionError::SaveWriteError(format!("Failed to write BRZ file: {:?}", e))),
@@ -76,7 +76,7 @@ pub fn write_brz_grids(
 
     match world.write_brz(&path) {
         Ok(_) => {
-            opts.logger.log(format!("Successfully wrote BRZ with multiple grids to {:?}", path));
+            opts.logger.log(format!("Successfully wrote BRZ with multiple grids to {}", path.display()));
             Ok(())
         }
         Err(e) => Err(ConversionError::SaveWriteError(format!("Failed to write BRZ file: {:?}", e))),

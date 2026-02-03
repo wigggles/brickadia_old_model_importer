@@ -16,11 +16,21 @@ Cargo.lock
 
 # End of https://www.toptal.com/developers/gitignore/api/rust
 
-/models/
-
 # IntelliJ
 .idea/
 *.iml
 
+#----------------------------------------------------------------
 # Data directory used for caches and model imports/exports
-data/
+data/user_cache/
+data/exports/
+data/imports/
+
+
+#----------------------------------------------------------------
+# texture material sources
+/models/
+data/game_textures/
+
+# but keep the README file
+!data/game_textures/README.md

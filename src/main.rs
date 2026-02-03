@@ -6,6 +6,7 @@ mod gui;
 mod icon;
 mod intersect;
 mod logger;
+mod material_mapping;
 mod octree;
 mod palette;
 mod simplify;
@@ -21,14 +22,14 @@ use gui::bool_color;
 use logger::Logger;
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use serde::{Deserialize, Serialize};
-use simplify::*;
+use simplify::{simplify_lossy, simplify_lossless, simplify_lossy_with_material, simplify_lossless_with_material};
 use std::{
     env, io::Cursor, ops::RangeInclusive, path::Path, path::PathBuf, sync::mpsc,
     sync::mpsc::Receiver, thread,
 };
 use tobj::LoadOptions;
 use uuid::Uuid;
-use voxelize::{voxelize_with_progress, VoxelizeProgress};
+use voxelize::{voxelize_with_progress, voxelize_from_pregrouped, PreGroupedTriangles, VoxelizeProgress};
 
 // Intermediate data structure for building the save
 #[derive(Clone)]
@@ -44,6 +45,14 @@ const WINDOW_HEIGHT: f32 = 700.;
 /// Enable verbose debug logging throughout the conversion pipeline.
 /// Set to `true` to see detailed information about each step.
 const DEBUG_MODE: bool = true;
+
+/// Enable verbose model loading logs (model names, vertex/face counts per model).
+/// When false, only shows total model count summary.
+const VERBOSE_MODEL_LOADING: bool = false;
+
+/// Enable verbose texture loading logs (shows each texture being loaded).
+/// When false, only shows materials that are missing textures.
+const VERBOSE_TEXTURE_LOADING: bool = false;
 
 const OBJ_ICON: &[u8; 10987] = include_bytes!("../res/obj_icon.png");
 
@@ -62,6 +71,23 @@ impl Default for InputFileType {
     }
 }
 
+/// How to apply colors to bricks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorMode {
+    /// Use texture colors from the model.
+    TextureColors,
+    /// Use a single solid color for all bricks (based on Material setting).
+    SingleColor,
+    /// Use material diffuse color from OBJ/MTL file.
+    MaterialColor,
+}
+
+impl Default for ColorMode {
+    fn default() -> Self {
+        ColorMode::TextureColors
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Obj2Brs {
     pub bricktype: BrickType,
@@ -70,6 +96,8 @@ pub struct Obj2Brs {
     input_file_path_receiver: Option<Receiver<Option<PathBuf>>>,
     input_file_path: String,
     pub match_brickadia_colorset: bool,
+    #[serde(default)]
+    color_mode: ColorMode,
     material: Material,
     material_intensity: u32,
     #[serde(skip)]
@@ -105,6 +133,13 @@ pub struct Obj2Brs {
     /// Scale multiplier for Z axis (default 1.0) - adjust to fix squished height
     #[serde(default = "default_axis_scale")]
     scale_z: f32,
+    /// Use texture-based material mapping for BSP conversions
+    #[serde(default)]
+    use_material_mapping: bool,
+    /// Group output grids by Brickadia material type (Plastic, Glass, Glow, etc.)
+    /// instead of one grid per texture. Can reduce 300+ grids to ~6 grids in some instances.
+    #[serde(default)]
+    group_by_brick_material: bool,
     #[serde(skip)]
     missing_resources_dialog: Option<String>,
     #[serde(skip)]
@@ -121,6 +156,8 @@ pub struct Obj2Brs {
     conversion_stage: std::sync::Arc<std::sync::Mutex<String>>,
     #[serde(skip)]
     conversion_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[serde(skip)]
+    conversion_start_time: Option<std::time::Instant>,
 
     // BSP conversion options
     /// Detected or selected input file type.
@@ -160,6 +197,8 @@ pub struct SettingsProfile {
     pub scale: f32,
     pub simplify: bool,
     pub match_brickadia_colorset: bool,
+    #[serde(default)]
+    pub color_mode: ColorMode,
     pub rotation_x: i32,
     pub rotation_y: i32,
     pub rotation_z: i32,
@@ -180,6 +219,7 @@ impl Default for SettingsProfile {
             scale: 1.0,
             simplify: false,
             match_brickadia_colorset: false,
+            color_mode: ColorMode::TextureColors,
             rotation_x: 0,
             rotation_y: 0,
             rotation_z: 0,
@@ -198,7 +238,7 @@ pub enum BrickType {
     Tiles,
 }
 
-#[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
 pub enum Material {
     Plastic,
     Glass,
@@ -229,6 +269,7 @@ impl Default for Obj2Brs {
             input_file_path_receiver: None,
             input_file_path: default_input,
             match_brickadia_colorset: false,
+            color_mode: ColorMode::TextureColors,
             material: Material::Plastic,
             material_intensity: 5,
             output_directory_receiver: None,
@@ -249,14 +290,17 @@ impl Default for Obj2Brs {
             scale_x: 1.0,
             scale_y: 1.0,
             scale_z: 1.0,
+            use_material_mapping: false,
+            group_by_brick_material: false,
             missing_resources_dialog: None,
             pending_conversion_skip_textures: false,
-            logger: Logger::new(),
+            logger: Logger::default(),
             conversion_in_progress: false,
             conversion_done_receiver: None,
             conversion_progress: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             conversion_stage: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             conversion_cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            conversion_start_time: None,
             // BSP options
             input_file_type: InputFileType::Obj,
             bsp_game_source: GameSource::Auto,
@@ -312,7 +356,7 @@ impl App for Obj2Brs {
                         }
                     });
                     if !stage.is_empty() {
-                        ui.label(RichText::new(&stage).color(egui::Color32::YELLOW).small());
+                        ui.label(RichText::new(&stage).color(egui::Color32::YELLOW));
                     }
                     ui.add_space(2.);
                 }
@@ -381,9 +425,28 @@ impl App for Obj2Brs {
                 ui.horizontal(|ui| {
                     let available_width = ui.available_width();
                     if self.conversion_in_progress {
-                        // Show Converting + Cancel buttons centered
-                        ui.add_space((available_width - 160.0) / 2.0);
+                        // Calculate elapsed time
+                        let elapsed_text = if let Some(start_time) = self.conversion_start_time {
+                            let elapsed = start_time.elapsed();
+                            let seconds = elapsed.as_secs();
+                            if seconds < 60 {
+                                format!("{}s", seconds)
+                            } else {
+                                let minutes = seconds / 60;
+                                let secs = seconds % 60;
+                                format!("{}m {}s", minutes, secs)
+                            }
+                        } else {
+                            "0s".to_string()
+                        };
+                        
+                        // Show Converting + Elapsed Time + Cancel buttons centered
+                        // Fixed width layout to prevent bouncing: Converting(100) + Time(60) + Cancel(60) = 220
+                        ui.add_space((available_width - 220.0) / 2.0);
                         ui.add_enabled(false, egui::Button::new("Converting..."));
+                        ui.add_space(5.0);
+                        ui.label(RichText::new(elapsed_text).color(egui::Color32::GRAY).monospace());
+                        ui.add_space(5.0);
                         if ui.button("Cancel").clicked() {
                             self.conversion_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
                             self.logger.log("Cancellation requested...".to_string());
@@ -463,6 +526,7 @@ impl Obj2Brs {
             if rx.try_recv().is_ok() {
                 self.conversion_done_receiver = None;
                 self.conversion_in_progress = false;
+                self.conversion_start_time = None;
             }
         }
     }
@@ -537,6 +601,60 @@ impl Obj2Brs {
                 }
             });
             ui.end_row();
+            
+            // Show texture assets status with green/yellow/red indicator
+            let game_source = self.detected_game_source.unwrap_or(self.bsp_game_source);
+            if game_source != GameSource::Auto {
+                let (exists, has_files, path_opt) = material_mapping::MaterialMapping::check_assets_dir(game_source);
+                let has_config = material_mapping::MaterialMapping::find_config_path(game_source).is_some();
+                
+                ui.label("Texture Assets").on_hover_text(
+                    "Status of extracted game textures for this game source.\n\n\
+                    Place your legally extracted game textures in the assets/ folder\n\
+                    to enable texture-based color sampling during conversion."
+                );
+                
+                ui.horizontal(|ui| {
+                    // Config status
+                    let config_icon = if has_config { "C" } else { "C" };
+                    let config_color = if has_config { egui::Color32::LIGHT_GREEN } else { egui::Color32::YELLOW };
+                    let config_tooltip = if has_config {
+                        "Material config found (auto_2block_materials.yaml)"
+                    } else {
+                        "No material config found - create auto_2block_materials.yaml"
+                    };
+                    ui.label(RichText::new(config_icon).color(config_color).strong())
+                        .on_hover_text(config_tooltip);
+                    
+                    // Assets status
+                    let (assets_icon, assets_color, assets_tooltip) = if has_files {
+                        ("A", egui::Color32::LIGHT_GREEN, "Assets directory has texture files")
+                    } else if exists {
+                        ("A", egui::Color32::YELLOW, "Assets directory exists but is empty - add extracted textures")
+                    } else {
+                        ("A", egui::Color32::from_rgb(255, 100, 100), "Assets directory not found")
+                    };
+                    ui.label(RichText::new(assets_icon).color(assets_color).strong())
+                        .on_hover_text(assets_tooltip);
+                    
+                    // Show path info
+                    if let Some(path) = path_opt {
+                        let status_text = if has_files {
+                            "Ready"
+                        } else if exists {
+                            "Empty"
+                        } else {
+                            "Missing"
+                        };
+                        ui.label(RichText::new(format!("[{}]", status_text)).small().color(assets_color));
+                        
+                        // Show path on hover
+                        ui.label(RichText::new("(?)").small().color(egui::Color32::GRAY))
+                            .on_hover_text(format!("Assets path: {}", path.display()));
+                    }
+                });
+                ui.end_row();
+            }
         }
 
         let dir_color = gui::bool_color(output_dir_valid);
@@ -564,7 +682,7 @@ impl Obj2Brs {
             }
             // Button to open output folder in file explorer
             if output_dir_valid {
-                if ui.button("📂").on_hover_text("Open output folder in file explorer").clicked() {
+                if ui.button("Open").on_hover_text("Open output folder in file explorer").clicked() {
                     let output_path = self.output_directory.clone();
                     thread::spawn(move || {
                         let _ = open_folder_in_explorer(&output_path);
@@ -584,9 +702,13 @@ impl Obj2Brs {
         ui.label("Lossy Conversion").on_hover_text(
             "Merges adjacent bricks of similar colors to reduce brick count.\n\n\
             This significantly reduces file size but may lose fine detail.\n\
-            Recommended for large models. Can take 5-10 minutes for complex models.",
+            Recommended for large models.\n\n\
+            WARNING: This is computationally expensive and can take 5-10+ minutes for complex models.",
         );
-        ui.add(Checkbox::new(&mut self.simplify, "Simplify (reduces brickcount)"));
+        ui.horizontal(|ui| {
+            ui.add(Checkbox::new(&mut self.simplify, "Simplify (reduces brickcount)"));
+            ui.label(RichText::new("(Expensive)").small().color(egui::Color32::from_rgb(255, 180, 0)));
+        });
         ui.end_row();
 
         ui.label("Scale")
@@ -610,12 +732,29 @@ impl Obj2Brs {
             • Microbricks: Smallest bricks (2x2x2 studs). Best detail.\n\
             • Default: Standard bricks with visible studs.\n\
             • Tiles: Flat smooth bricks without studs.");
-        ComboBox::from_label("")
+        ComboBox::from_id_source("bricktype_combo")
             .selected_text(format!("{:?}", &mut self.bricktype))
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.bricktype, BrickType::Microbricks, "Microbricks");
                 ui.selectable_value(&mut self.bricktype, BrickType::Default, "Default");
                 ui.selectable_value(&mut self.bricktype, BrickType::Tiles, "Tiles");
+            });
+        ui.end_row();
+
+        ui.label("Color Mode").on_hover_text("How colors are applied to bricks:\n\n\
+            • Texture Colors: Use colors from model textures (default, most accurate).\n\
+            • Material Color: Use the OBJ material's diffuse color.\n\
+            • Single Color: Use one solid color for all bricks (based on Material setting below).");
+        ComboBox::from_id_source("color_mode_combo")
+            .selected_text(match self.color_mode {
+                ColorMode::TextureColors => "Texture Colors",
+                ColorMode::MaterialColor => "Material Color",
+                ColorMode::SingleColor => "Single Color",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.color_mode, ColorMode::TextureColors, "Texture Colors");
+                ui.selectable_value(&mut self.color_mode, ColorMode::MaterialColor, "Material Color");
+                ui.selectable_value(&mut self.color_mode, ColorMode::SingleColor, "Single Color");
             });
         ui.end_row();
 
@@ -638,121 +777,149 @@ impl Obj2Brs {
             });
         ui.end_row();
 
-        // Rotation overrides
-        ui.label("Rotation X").on_hover_text(
-            "Rotate model around the X axis (left-right axis).\n\n\
-            In Brickadia coordinates:\n\
-            • 0° = No rotation\n\
-            • 90° = Tilt forward (top faces you)\n\
-            • 180° = Flip upside down\n\
-            • 270° = Tilt backward (bottom faces you)\n\n\
-            Use this to fix models that appear tilted forward/back.",
-        );
-        ComboBox::from_id_source("rotation_x")
-            .selected_text(format!("{}°", self.rotation_x))
-            .show_ui(ui, |ui: &mut Ui| {
-                ui.selectable_value(&mut self.rotation_x, 0, "0°");
-                ui.selectable_value(&mut self.rotation_x, 90, "90°");
-                ui.selectable_value(&mut self.rotation_x, 180, "180°");
-                ui.selectable_value(&mut self.rotation_x, 270, "270°");
-            });
+        ui.label("");
+        ui.vertical(|ui| {
+            CollapsingHeader::new("Rotation & Orientation")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.add_space(5.);
+                    ui.label(RichText::new("Fix models that import facing the wrong direction or tilted")
+                        .color(egui::Color32::GRAY));
+                    ui.add_space(10.);
+                    
+                    gui::add_grid(ui, "rotation_grid", |ui| {
+                        ui.label("Rotation X").on_hover_text(
+                            "Rotate model around the X axis (left-right axis).\n\n\
+                            In Brickadia coordinates:\n\
+                            • 0° = No rotation\n\
+                            • 90° = Tilt forward (top faces you)\n\
+                            • 180° = Flip upside down\n\
+                            • 270° = Tilt backward (bottom faces you)\n\n\
+                            Use this to fix models that appear tilted forward/back.",
+                        );
+                        ComboBox::from_id_source("rotation_x")
+                            .selected_text(format!("{}°", self.rotation_x))
+                            .show_ui(ui, |ui: &mut Ui| {
+                                ui.selectable_value(&mut self.rotation_x, 0, "0°");
+                                ui.selectable_value(&mut self.rotation_x, 90, "90°");
+                                ui.selectable_value(&mut self.rotation_x, 180, "180°");
+                                ui.selectable_value(&mut self.rotation_x, 270, "270°");
+                            });
+                        ui.end_row();
+
+                        ui.label("Rotation Y").on_hover_text(
+                            "Rotate model around the Y axis (forward-back axis).\n\n\
+                            In Brickadia coordinates:\n\
+                            • 0° = No rotation\n\
+                            • 90° = Roll left (left side up)\n\
+                            • 180° = Flip left-right\n\
+                            • 270° = Roll right (right side up)\n\n\
+                            Use this to fix models that appear rolled/tilted sideways.",
+                        );
+                        ComboBox::from_id_source("rotation_y")
+                            .selected_text(format!("{}°", self.rotation_y))
+                            .show_ui(ui, |ui: &mut Ui| {
+                                ui.selectable_value(&mut self.rotation_y, 0, "0°");
+                                ui.selectable_value(&mut self.rotation_y, 90, "90°");
+                                ui.selectable_value(&mut self.rotation_y, 180, "180°");
+                                ui.selectable_value(&mut self.rotation_y, 270, "270°");
+                            });
+                        ui.end_row();
+
+                        ui.label("Rotation Z").on_hover_text(
+                            "Rotate model around the Z axis (up-down axis).\n\n\
+                            In Brickadia coordinates:\n\
+                            • 0° = No rotation\n\
+                            • 90° = Spin 90° counter-clockwise (viewed from above)\n\
+                            • 180° = Face opposite direction\n\
+                            • 270° = Spin 90° clockwise (viewed from above)\n\n\
+                            Use this to change which direction the model faces.",
+                        );
+                        ComboBox::from_id_source("rotation_z")
+                            .selected_text(format!("{}°", self.rotation_z))
+                            .show_ui(ui, |ui: &mut Ui| {
+                                ui.selectable_value(&mut self.rotation_z, 0, "0°");
+                                ui.selectable_value(&mut self.rotation_z, 90, "90°");
+                                ui.selectable_value(&mut self.rotation_z, 180, "180°");
+                                ui.selectable_value(&mut self.rotation_z, 270, "270°");
+                            });
+                        ui.end_row();
+
+                        ui.label("Origin Marker").on_hover_text(
+                            "Add color-coded axis markers at the origin (0,0,0) for alignment testing.\n\n\
+                            In Brickadia coordinates:\n\
+                            • White brick at origin center\n\
+                            • Red bricks along +X axis (right in Brickadia)\n\
+                            • Green bricks along +Y axis (forward in Brickadia)\n\
+                            • Blue bricks along +Z axis (up in Brickadia)\n\n\
+                            Useful for verifying model orientation after import.",
+                        );
+                        ui.add(Checkbox::new(&mut self.show_origin_marker, "Show XYZ Axis"));
+                        ui.end_row();
+                    });
+                });
+        });
         ui.end_row();
 
-        ui.label("Rotation Y").on_hover_text(
-            "Rotate model around the Y axis (forward-back axis).\n\n\
-            In Brickadia coordinates:\n\
-            • 0° = No rotation\n\
-            • 90° = Roll left (left side up)\n\
-            • 180° = Flip left-right\n\
-            • 270° = Roll right (right side up)\n\n\
-            Use this to fix models that appear rolled/tilted sideways.",
-        );
-        ComboBox::from_id_source("rotation_y")
-            .selected_text(format!("{}°", self.rotation_y))
-            .show_ui(ui, |ui: &mut Ui| {
-                ui.selectable_value(&mut self.rotation_y, 0, "0°");
-                ui.selectable_value(&mut self.rotation_y, 90, "90°");
-                ui.selectable_value(&mut self.rotation_y, 180, "180°");
-                ui.selectable_value(&mut self.rotation_y, 270, "270°");
-            });
-        ui.end_row();
+        ui.label("");
+        ui.vertical(|ui| {
+            CollapsingHeader::new("Per-Axis Scaling")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.add_space(5.);
+                    ui.label(RichText::new("Fix models that appear stretched or squished on specific axes")
+                        .color(egui::Color32::GRAY));
+                    ui.add_space(10.);
+                    
+                    gui::add_grid(ui, "axis_scale_grid", |ui| {
+                        ui.label("Scale X").on_hover_text(
+                            "Scale multiplier for the X axis (left-right in Brickadia).\n\n\
+                            Default: 1.0 (no change)\n\
+                            Use values > 1.0 to stretch, < 1.0 to compress.\n\n\
+                            Adjust if model appears stretched or squished horizontally.",
+                        );
+                        ui.add(
+                            DragValue::new(&mut self.scale_x)
+                                .min_decimals(2)
+                                .prefix("x")
+                                .speed(0.01)
+                                .range(0.1..=10.0),
+                        );
+                        ui.end_row();
 
-        ui.label("Rotation Z").on_hover_text(
-            "Rotate model around the Z axis (up-down axis).\n\n\
-            In Brickadia coordinates:\n\
-            • 0° = No rotation\n\
-            • 90° = Spin 90° counter-clockwise (viewed from above)\n\
-            • 180° = Face opposite direction\n\
-            • 270° = Spin 90° clockwise (viewed from above)\n\n\
-            Use this to change which direction the model faces.",
-        );
-        ComboBox::from_id_source("rotation_z")
-            .selected_text(format!("{}°", self.rotation_z))
-            .show_ui(ui, |ui: &mut Ui| {
-                ui.selectable_value(&mut self.rotation_z, 0, "0°");
-                ui.selectable_value(&mut self.rotation_z, 90, "90°");
-                ui.selectable_value(&mut self.rotation_z, 180, "180°");
-                ui.selectable_value(&mut self.rotation_z, 270, "270°");
-            });
-        ui.end_row();
+                        ui.label("Scale Y").on_hover_text(
+                            "Scale multiplier for the Y axis (forward-back in Brickadia).\n\n\
+                            Default: 1.0 (no change)\n\
+                            Use values > 1.0 to stretch, < 1.0 to compress.\n\n\
+                            Adjust if model appears stretched or squished in depth.",
+                        );
+                        ui.add(
+                            DragValue::new(&mut self.scale_y)
+                                .min_decimals(2)
+                                .prefix("x")
+                                .speed(0.01)
+                                .range(0.1..=10.0),
+                        );
+                        ui.end_row();
 
-        ui.label("Origin Marker").on_hover_text(
-            "Add color-coded axis markers at the origin (0,0,0) for alignment testing.\n\n\
-            In Brickadia coordinates:\n\
-            • White brick at origin center\n\
-            • Red bricks along +X axis (right in Brickadia)\n\
-            • Green bricks along +Y axis (forward in Brickadia)\n\
-            • Blue bricks along +Z axis (up in Brickadia)\n\n\
-            Useful for verifying model orientation after import.",
-        );
-        ui.add(Checkbox::new(&mut self.show_origin_marker, "Show XYZ Axis"));
-        ui.end_row();
-
-        // Axis scale overrides
-        ui.label("Scale X").on_hover_text(
-            "Scale multiplier for the X axis (left-right in Brickadia).\n\n\
-            Default: 1.0 (no change)\n\
-            Use values > 1.0 to stretch, < 1.0 to compress.\n\n\
-            Adjust if model appears stretched or squished horizontally.",
-        );
-        ui.add(
-            DragValue::new(&mut self.scale_x)
-                .min_decimals(2)
-                .prefix("x")
-                .speed(0.01)
-                .range(0.1..=10.0),
-        );
-        ui.end_row();
-
-        ui.label("Scale Y").on_hover_text(
-            "Scale multiplier for the Y axis (forward-back in Brickadia).\n\n\
-            Default: 1.0 (no change)\n\
-            Use values > 1.0 to stretch, < 1.0 to compress.\n\n\
-            Adjust if model appears stretched or squished in depth.",
-        );
-        ui.add(
-            DragValue::new(&mut self.scale_y)
-                .min_decimals(2)
-                .prefix("x")
-                .speed(0.01)
-                .range(0.1..=10.0),
-        );
-        ui.end_row();
-
-        ui.label("Scale Z").on_hover_text(
-            "Scale multiplier for the Z axis (up-down in Brickadia).\n\n\
-            Default: 1.0 (no change)\n\
-            Use values > 1.0 to stretch vertically, < 1.0 to compress.\n\n\
-            **Common fix**: If model appears squished/flat, try 2.5 to compensate\n\
-            for Brickadia's plate height ratio (plates are 2.5x shorter than wide).",
-        );
-        ui.add(
-            DragValue::new(&mut self.scale_z)
-                .min_decimals(2)
-                .prefix("x")
-                .speed(0.01)
-                .range(0.1..=10.0),
-        );
+                        ui.label("Scale Z").on_hover_text(
+                            "Scale multiplier for the Z axis (up-down in Brickadia).\n\n\
+                            Default: 1.0 (no change)\n\
+                            Use values > 1.0 to stretch vertically, < 1.0 to compress.\n\n\
+                            **Common fix**: If model appears squished/flat, try 2.5 to compensate\n\
+                            for Brickadia's plate height ratio (plates are 2.5x shorter than wide).",
+                        );
+                        ui.add(
+                            DragValue::new(&mut self.scale_z)
+                                .min_decimals(2)
+                                .prefix("x")
+                                .speed(0.01)
+                                .range(0.1..=10.0),
+                        );
+                        ui.end_row();
+                    });
+                });
+        });
         ui.end_row();
     }
 
@@ -831,6 +998,7 @@ impl Obj2Brs {
         self.scale = defaults.scale;
         self.simplify = defaults.simplify;
         self.match_brickadia_colorset = defaults.match_brickadia_colorset;
+        self.color_mode = defaults.color_mode;
         self.rotation_x = defaults.rotation_x;
         self.rotation_y = defaults.rotation_y;
         self.rotation_z = defaults.rotation_z;
@@ -852,6 +1020,7 @@ impl Obj2Brs {
             scale: self.scale,
             simplify: self.simplify,
             match_brickadia_colorset: self.match_brickadia_colorset,
+            color_mode: self.color_mode,
             rotation_x: self.rotation_x,
             rotation_y: self.rotation_y,
             rotation_z: self.rotation_z,
@@ -886,6 +1055,7 @@ impl Obj2Brs {
         self.scale = profile.scale;
         self.simplify = profile.simplify;
         self.match_brickadia_colorset = profile.match_brickadia_colorset;
+        self.color_mode = profile.color_mode;
         self.rotation_x = profile.rotation_x;
         self.rotation_y = profile.rotation_y;
         self.rotation_z = profile.rotation_z;
@@ -918,33 +1088,101 @@ impl Obj2Brs {
         ui.add(Checkbox::new(&mut self.match_brickadia_colorset, "Use Default Palette"));
         ui.end_row();
 
-        ui.label("Split by Material (Experimental)").on_hover_text(
-            "Creates separate frozen brick grids for each OBJ material.\n\n\
-            Useful for models with distinct parts you want to move independently.\n\
-            Each material becomes its own selectable group in Brickadia.",
-        );
-        ui.add(Checkbox::new(&mut self.split_by_material, "Separate grids per material"));
+        ui.label("");
+        ui.vertical(|ui| {
+            CollapsingHeader::new("Experimental Material Processing")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.add_space(5.);
+                    
+                    ui.label(RichText::new("WARNING: Processing large models with many materials can take 1+ hours")
+                        .color(egui::Color32::from_rgb(255, 180, 0)));
+                    
+                    ui.add_space(10.);
+                    
+                    gui::add_grid(ui, "experimental_material_grid", |ui| {
+                        ui.label("Split by Material").on_hover_text(
+                            "Creates separate frozen brick grids for each OBJ material.\n\n\
+                            Useful for models with distinct parts you want to move independently.\n\
+                            Each material becomes its own selectable group in Brickadia.",
+                        );
+                        ui.add(Checkbox::new(&mut self.split_by_material, "Separate grids per material"));
+                        ui.end_row();
+
+                        // Material mapping option (requires split_by_material)
+                        if self.split_by_material {
+                            let game_source = self.detected_game_source.unwrap_or(self.bsp_game_source);
+                            let has_config = game_source != GameSource::Auto && 
+                                material_mapping::MaterialMapping::find_config_path(game_source).is_some();
+                            
+                            ui.label("Auto-assign Materials").on_hover_text(
+                                "Map textures to Brickadia materials based on texture names.\n\n\
+                                Uses YAML config files in data/game_textures/<engine>/<game>/auto_2block_materials.yaml\n\
+                                to determine which textures should be Glass, Metallic, Glow, etc.\n\n\
+                                Example: GLASS* textures = Glass material, METAL* = Metallic\n\n\
+                                Each material can have its own intensity setting in the config.\n\n\
+                                WARNING: This is computationally expensive for large models.\n\n\
+                                When enabled, the global Material and Material Intensity settings are ignored.",
+                            );
+                            
+                            ui.horizontal(|ui| {
+                                if has_config {
+                                    ui.add(Checkbox::new(&mut self.use_material_mapping, "Enable"));
+                                    ui.label(RichText::new("(Expensive)").small().color(egui::Color32::from_rgb(255, 180, 0)));
+                                } else {
+                                    ui.add_enabled(false, Checkbox::new(&mut false, "Enable"));
+                                    if game_source == GameSource::Auto {
+                                        ui.label(RichText::new("(Select a game source)").small().color(egui::Color32::GRAY));
+                                    } else {
+                                        ui.label(RichText::new(format!("(No config for {})", game_source.display_name())).small().color(egui::Color32::GRAY));
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            
+                            // Show info about where to put config if missing
+                            if !has_config && game_source != GameSource::Auto {
+                                ui.label("");
+                                ui.label(RichText::new(
+                                    format!("Create: data/game_textures/{}/*/auto_2block_materials.yaml", game_source.folder_name())
+                                ).small().color(egui::Color32::DARK_GRAY));
+                                ui.end_row();
+                            }
+                            
+                            // Group by Brickadia material type option
+                            ui.label("Group by Material Type").on_hover_text(
+                                "Consolidate output grids by Brickadia material type.\n\n\
+                                OFF: One grid per texture (300+ grids for complex maps)\n\
+                                ON: One grid per material type (~6 grids: Plastic, Glass, Glow, Metallic, etc.)\n\n\
+                                Fewer grids = simpler to manage, but less granular selection in-game.",
+                            );
+                            ui.add(Checkbox::new(&mut self.group_by_brick_material, "Consolidate grids"));
+                            ui.end_row();
+                        }
+
+                        if self.split_by_material {
+                            ui.label("Grid Offset X").on_hover_text(
+                                "Horizontal spacing between material grids",
+                            );
+                            ui.add(DragValue::new(&mut self.grid_offset_x).suffix(" units").speed(10.0));
+                            ui.end_row();
+
+                            ui.label("Grid Offset Y").on_hover_text(
+                                "Forward/back spacing between material grids",
+                            );
+                            ui.add(DragValue::new(&mut self.grid_offset_y).suffix(" units").speed(10.0));
+                            ui.end_row();
+
+                            ui.label("Grid Offset Z").on_hover_text(
+                                "Vertical spacing between material grids",
+                            );
+                            ui.add(DragValue::new(&mut self.grid_offset_z).suffix(" units").speed(10.0));
+                            ui.end_row();
+                        }
+                    });
+                });
+        });
         ui.end_row();
-
-        if self.split_by_material {
-            ui.label("Grid Offset X").on_hover_text(
-                "Horizontal spacing between material grids",
-            );
-            ui.add(DragValue::new(&mut self.grid_offset_x).suffix(" units").speed(10.0));
-            ui.end_row();
-
-            ui.label("Grid Offset Y").on_hover_text(
-                "Forward/back spacing between material grids",
-            );
-            ui.add(DragValue::new(&mut self.grid_offset_y).suffix(" units").speed(10.0));
-            ui.end_row();
-
-            ui.label("Grid Offset Z").on_hover_text(
-                "Vertical spacing between material grids",
-            );
-            ui.add(DragValue::new(&mut self.grid_offset_z).suffix(" units").speed(10.0));
-            ui.end_row();
-        }
 
         if self.bricktype == BrickType::Microbricks {
             ui.label("Brick Scale")
@@ -985,7 +1223,7 @@ impl Obj2Brs {
             ui.add(TextEdit::singleline(&mut cache_path_str.clone())
                 .desired_width(350.0)
                 .interactive(false));
-            if ui.button("📂").on_hover_text("Open cache folder").clicked() {
+            if ui.button("Open").on_hover_text("Open cache folder").clicked() {
                 let path = cache_path_str.clone();
                 thread::spawn(move || {
                     let _ = open_folder_in_explorer(&path);
@@ -1000,7 +1238,7 @@ impl Obj2Brs {
 
         ui.add_space(5.);
         ui.horizontal(|ui| {
-            if ui.button("🗑 Clear Cache").on_hover_text("Delete all cached data (settings will reset on next launch)").clicked() {
+            if ui.button("Clear Cache").on_hover_text("Delete all cached data (settings will reset on next launch)").clicked() {
                 if let Err(e) = logger::flush_cache() {
                     self.logger.log(format!("Failed to clear cache: {}", e));
                 } else {
@@ -1018,7 +1256,7 @@ impl Obj2Brs {
             ui.add(TextEdit::singleline(&mut data_path_str.clone())
                 .desired_width(350.0)
                 .interactive(false));
-            if ui.button("📂").on_hover_text("Open data folder").clicked() {
+            if ui.button("Open").on_hover_text("Open data folder").clicked() {
                 let path = data_path_str.clone();
                 thread::spawn(move || {
                     let _ = open_folder_in_explorer(&path);
@@ -1032,13 +1270,13 @@ impl Obj2Brs {
             let prefabs_path = match env::consts::OS {
                 "windows" => {
                     dirs::data_local_dir()
-                        .map(|p| p.join("Brickadia\\Saved\\Prefabs"))
+                        .map(|p| p.join("Brickadia").join("Saved").join("Prefabs"))
                         .and_then(|p| p.to_str().map(|s| s.to_string()))
                         .unwrap_or_else(|| "Not found".to_string())
                 }
                 "linux" => {
                     dirs::config_dir()
-                        .map(|p| p.join("Epic/Brickadia/Saved/Prefabs"))
+                        .map(|p| p.join("Epic").join("Brickadia").join("Saved").join("Prefabs"))
                         .and_then(|p| p.to_str().map(|s| s.to_string()))
                         .unwrap_or_else(|| "Not found".to_string())
                 }
@@ -1047,7 +1285,7 @@ impl Obj2Brs {
             ui.add(TextEdit::singleline(&mut prefabs_path.clone())
                 .desired_width(350.0)
                 .interactive(false));
-            if ui.button("📂").on_hover_text("Open Brickadia Prefabs folder (paste .brz files here)").clicked() {
+            if ui.button("Open").on_hover_text("Open Brickadia Prefabs folder (paste .brz files here)").clicked() {
                 let path = prefabs_path.clone();
                 thread::spawn(move || {
                     let _ = open_folder_in_explorer(&path);
@@ -1059,7 +1297,7 @@ impl Obj2Brs {
     fn show_missing_resources_dialog(&mut self, ctx: &egui::Context) {
         if let Some(message) = &self.missing_resources_dialog.clone() {
             let mut open = true;
-            Window::new("⚠ Missing Resources")
+            Window::new("Missing Resources")
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
@@ -1138,6 +1376,7 @@ impl Obj2Brs {
 
     fn do_bsp_conversion(&mut self) {
         self.conversion_in_progress = true;
+        self.conversion_start_time = Some(std::time::Instant::now());
         self.conversion_progress.store(0, std::sync::atomic::Ordering::Relaxed);
         self.conversion_cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut stage) = self.conversion_stage.lock() {
@@ -1168,7 +1407,11 @@ impl Obj2Brs {
         let scale_x = self.scale_x;
         let scale_y = self.scale_y;
         let scale_z = self.scale_z;
+        let use_material_mapping = self.use_material_mapping;
+        let group_by_brick_material = self.group_by_brick_material;
+        let detected_game_source = self.detected_game_source;
         let match_brickadia_colorset = self.match_brickadia_colorset;
+        let color_mode = self.color_mode;
         let brick_scale = self.brick_scale;
         let material = self.material;
         let material_intensity = self.material_intensity;
@@ -1206,25 +1449,38 @@ impl Obj2Brs {
                 return;
             }
             if DEBUG_MODE {
-                logger.log(format!("[DEBUG] BSP temp directory: {:?}", temp_dir));
+                logger.log(format!("[DEBUG] BSP temp directory: {}", temp_dir.display()));
             }
 
             // Convert BSP to OBJ
-            // Check for external texture directory (VTF files for GoldSrc)
-            let texture_dir = Path::new("data/game_textures/goldsrc_textures/materials");
-            let texture_dir_opt = if texture_dir.exists() {
-                logger.log(format!("Using external textures from: {:?}", texture_dir));
-                Some(texture_dir)
-            } else {
+            // Check for external texture directory based on game source
+            let texture_dir_opt = material_mapping::MaterialMapping::get_assets_dir(bsp_game_source)
+                .and_then(|path| {
+                    if path.exists() {
+                        let has_files = std::fs::read_dir(&path)
+                            .map(|mut entries| entries.next().is_some())
+                            .unwrap_or(false);
+                        if has_files {
+                            logger.log(format!("Using external textures from: {}", path.display()));
+                            Some(path)
+                        } else {
+                            logger.log(format!("Assets directory exists but is empty: {}", path.display()));
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+            
+            if texture_dir_opt.is_none() {
                 logger.log("No external texture directory found, using embedded/inferred colors".to_string());
-                None
-            };
+            }
             
             let bsp_result = bsp_converter::convert_bsp_to_obj_with_game_and_textures(
                 &input_file_path,
                 &temp_dir,
                 bsp_game_source,
-                texture_dir_opt,
+                texture_dir_opt.as_ref().map(|p| p.as_path()),
             );
 
             if let Err(e) = bsp_result {
@@ -1267,6 +1523,7 @@ impl Obj2Brs {
                 input_file_path_receiver: None,
                 input_file_path: obj_path_str,
                 match_brickadia_colorset,
+                color_mode,
                 material,
                 material_intensity,
                 output_directory_receiver: None,
@@ -1287,6 +1544,8 @@ impl Obj2Brs {
                 scale_x,
                 scale_y,
                 scale_z,
+                use_material_mapping,
+                group_by_brick_material,
                 missing_resources_dialog: None,
                 pending_conversion_skip_textures: false,
                 logger: logger.clone(),
@@ -1295,9 +1554,10 @@ impl Obj2Brs {
                 conversion_progress: progress.clone(),
                 conversion_stage: stage.clone(),
                 conversion_cancelled: cancelled.clone(),
+                conversion_start_time: None,
                 input_file_type: InputFileType::Obj,
-                bsp_game_source: GameSource::Auto,
-                detected_game_source: None,
+                bsp_game_source: bsp_game_source,
+                detected_game_source: detected_game_source,
                 profiles: Vec::new(),
                 selected_profile_index: None,
                 new_profile_name: String::new(),
@@ -1324,6 +1584,7 @@ impl Obj2Brs {
 
     fn continue_conversion(&mut self, skip_textures: bool) {
         self.conversion_in_progress = true;
+        self.conversion_start_time = Some(std::time::Instant::now());
         self.conversion_progress.store(0, std::sync::atomic::Ordering::Relaxed);
         self.conversion_cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut stage) = self.conversion_stage.lock() {
@@ -1354,7 +1615,12 @@ impl Obj2Brs {
         let scale_x = self.scale_x;
         let scale_y = self.scale_y;
         let scale_z = self.scale_z;
+        let use_material_mapping = self.use_material_mapping;
+        let group_by_brick_material = self.group_by_brick_material;
+        let bsp_game_source = self.bsp_game_source;
+        let detected_game_source = self.detected_game_source;
         let match_brickadia_colorset = self.match_brickadia_colorset;
+        let color_mode = self.color_mode;
         let brick_scale = self.brick_scale;
         let material = self.material;
         let material_intensity = self.material_intensity;
@@ -1372,6 +1638,7 @@ impl Obj2Brs {
                 input_file_path_receiver: None,
                 input_file_path,
                 match_brickadia_colorset,
+                color_mode,
                 material,
                 material_intensity,
                 output_directory_receiver: None,
@@ -1392,6 +1659,8 @@ impl Obj2Brs {
                 scale_x,
                 scale_y,
                 scale_z,
+                use_material_mapping,
+                group_by_brick_material,
                 missing_resources_dialog: None,
                 pending_conversion_skip_textures: false,
                 logger: logger.clone(),
@@ -1400,10 +1669,11 @@ impl Obj2Brs {
                 conversion_progress: progress.clone(),
                 conversion_stage: stage.clone(),
                 conversion_cancelled: cancelled.clone(),
-                // BSP fields (not used in OBJ conversion path)
+                conversion_start_time: None,
+                // BSP fields
                 input_file_type: InputFileType::Obj,
-                bsp_game_source: GameSource::Auto,
-                detected_game_source: None,
+                bsp_game_source,
+                detected_game_source,
                 profiles: Vec::new(),
                 selected_profile_index: None,
                 new_profile_name: String::new(),
@@ -1571,8 +1841,41 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
         // Load models and materials once
         set_progress(opts, 5, "Loading models and materials...");
         opts.logger.log("Loading models and materials...".to_string());
-        let (mut models, material_images) = load_models_and_materials(opts, skip_textures)?;
+        let (mut models, material_images, material_names) = load_models_and_materials(opts, skip_textures)?;
         let material_count = material_images.len();
+
+        // Load material mapping with cache if enabled
+        let mut cached_mapping = if opts.use_material_mapping {
+            let game_source = opts.detected_game_source.unwrap_or(opts.bsp_game_source);
+            if game_source != GameSource::Auto {
+                match material_mapping::CachedMaterialMapping::load(game_source) {
+                    Some(mut mapping) => {
+                        let initial_cache_size = mapping.cache_size();
+                        
+                        // Pre-populate cache with all prefixes from config if cache is empty or small
+                        if initial_cache_size < 10 {
+                            opts.logger.log("Building material cache from config prefixes...".to_string());
+                            mapping.build_cache_from_config();
+                            let new_cache_size = mapping.cache_size();
+                            if new_cache_size > initial_cache_size {
+                                opts.logger.log(format!("Pre-populated cache with {} entries", new_cache_size - initial_cache_size));
+                            }
+                        }
+                        
+                        opts.logger.log(format!("Loaded material mapping for {} ({} cached entries)", game_source.display_name(), mapping.cache_size()));
+                        Some(mapping)
+                    }
+                    None => {
+                        opts.logger.log(format!("No material mapping found for {}, using default material", game_source.display_name()));
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         if material_count == 0 {
             opts.logger.log("No materials found, falling back to single grid".to_string());
@@ -1584,21 +1887,108 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
 
         opts.logger.log(format!("Found {} materials, processing each separately", material_count));
 
+        // Pre-extract and group triangles by material (Option A optimization)
+        // This avoids re-parsing all models for each material
+        set_progress(opts, 8, "Pre-grouping triangles by material...");
+        opts.logger.log("Pre-grouping triangles by material...".to_string());
+        let pregrouped = PreGroupedTriangles::from_models(&models);
+        opts.logger.log(format!("Extracted {} triangles into {} material groups", 
+            pregrouped.total_count, pregrouped.by_material.len()));
+        
+        // Debug: show which material IDs actually have triangles
+        for (mat_key, tris) in &pregrouped.by_material {
+            opts.logger.log(format!("  Material {:?}: {} triangles", mat_key, tris.len()));
+        }
+
+        // Pre-compute material mappings before parallel processing (avoids mutable borrow issues)
+        let material_mappings: Vec<(Material, u8)> = if let Some(ref mut mapping) = cached_mapping {
+            (0..material_count).map(|mat_id| {
+                let mat_name = material_names.get(mat_id).cloned().unwrap_or_else(|| format!("material_{}", mat_id));
+                mapping.get_material_and_intensity(&mat_name)
+            }).collect()
+        } else {
+            vec![(opts.material, opts.material_intensity as u8); material_count]
+        };
+
         // Process each material separately
+        // Note: brdb types (Brick, Entity) are not Send/Sync, so we process sequentially
+        // but benefit from Option A optimization (pre-grouped triangles)
+        
+        // If grouping by brick material type, collect bricks into buckets first
+        use std::collections::HashMap;
+        let mut bricks_by_type: HashMap<Material, Vec<Brick>> = HashMap::new();
         let mut material_grids: Vec<(Entity, Vec<Brick>)> = Vec::new();
 
+        let mut skipped_count = 0;
+        let mut processed_count = 0;
+        let mut total_processing_time = 0.0f32;
+        let mut avg_time_per_material = 1.0f32; // Start with 1 second assumption
+        
         for mat_id in 0..material_count {
             if is_cancelled(opts) {
                 opts.logger.log("Conversion cancelled.".to_string());
                 return Ok(());
             }
             
+            let mat_name = material_names.get(mat_id).cloned().unwrap_or_else(|| format!("material_{}", mat_id));
+            
+            // Early skip: check if material has triangles and reasonable bounds
+            let triangles = pregrouped.get_material(mat_id);
+            let bounds = pregrouped.get_material_bounds(mat_id);
+            
+            if triangles.is_none() || triangles.map(|t| t.is_empty()).unwrap_or(true) {
+                skipped_count += 1;
+                debug_log(&opts.logger, format!("Material {} ({}) - SKIPPED: no triangles found in pregrouped data", 
+                    mat_id, mat_name));
+                continue; // No triangles for this material
+            }
+            
+            // Skip materials with bounds smaller than 1 voxel (too tiny to render)
+            if let Some(b) = bounds {
+                let size_x = (b.max.x - b.min.x).abs();
+                let size_y = (b.max.y - b.min.y).abs();
+                let size_z = (b.max.z - b.min.z).abs();
+                if size_x < 0.5 && size_y < 0.5 && size_z < 0.5 {
+                    skipped_count += 1;
+                    debug_log(&opts.logger, format!("Material {} ({}) - SKIPPED: too small ({:.2}x{:.2}x{:.2})", 
+                        mat_id, mat_name, size_x, size_y, size_z));
+                    continue;
+                }
+                // Log bounds info for materials we're processing
+                debug_log(&opts.logger, format!("Material {} ({}) bounds: min({:.1},{:.1},{:.1}) max({:.1},{:.1},{:.1}) size({:.1}x{:.1}x{:.1})", 
+                    mat_id, mat_name, b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z, size_x, size_y, size_z));
+            } else {
+                debug_log(&opts.logger, format!("Material {} ({}) - WARNING: no bounds found", mat_id, mat_name));
+            }
+            
+            let triangle_count = triangles.map(|t| t.len()).unwrap_or(0);
+            
+            let mat_start = std::time::Instant::now();
             let base_progress = 10 + (mat_id * 80 / material_count) as u32;
-            set_progress(opts, base_progress, &format!("Processing material {} of {}", mat_id + 1, material_count));
-            opts.logger.log(format!("Processing material {} of {}", mat_id + 1, material_count));
+            
+            // Calculate ETA based on average processing time
+            let materials_remaining = material_count - mat_id - 1;
+            let eta_seconds = (materials_remaining as f32 * avg_time_per_material).max(0.0);
+            let eta_text = if eta_seconds < 60.0 {
+                format!(" (est. {}s left)", eta_seconds.ceil() as u32)
+            } else {
+                let minutes = (eta_seconds / 60.0).floor() as u32;
+                let seconds = (eta_seconds % 60.0).ceil() as u32;
+                format!(" (est. {}m {}s left)", minutes, seconds)
+            };
+            
+            set_progress(opts, base_progress, &format!("Processing material {} ({}, {} tris) of {}{}", 
+                mat_id + 1, mat_name, triangle_count, material_count, eta_text));
 
-            // Voxelize only this material
-            let mut octree = voxelize_models(&mut models, &material_images, opts, Some(mat_id));
+            let (brick_material, brick_intensity) = material_mappings[mat_id];
+
+            // Voxelize using pre-grouped triangles (much faster than re-parsing models)
+            // Returns (octree, world_offset) - we need to add world_offset back to brick positions
+            let (mut octree, world_offset) = voxelize_from_pregrouped(&pregrouped, &material_images, mat_id, None, Some(&opts.logger));
+            
+            // Log voxelization results
+            debug_log(&opts.logger, format!("Material {} ({}) voxelized: octree size {}, offset({:.1},{:.1},{:.1})", 
+                mat_id, mat_name, octree.size, world_offset.x, world_offset.y, world_offset.z));
 
             let max_merge = 500;
             let mut save_data = SaveData {
@@ -1607,32 +1997,91 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
                 author_name: opts.save_owner_name.clone(),
             };
 
-            set_progress(opts, base_progress + 5, &format!("Simplifying material {}...", mat_id + 1));
-            opts.logger.log(format!("Simplifying material {}...", mat_id));
             if opts.simplify {
-                simplify_lossy(&mut octree, &mut save_data, opts, max_merge);
+                simplify_lossy_with_material(&mut octree, &mut save_data, opts, max_merge, brick_material, brick_intensity);
             } else {
-                simplify_lossless(&mut octree, &mut save_data, opts, max_merge);
+                simplify_lossless_with_material(&mut octree, &mut save_data, opts, max_merge, brick_material, brick_intensity);
+            }
+            
+            // Apply world offset to restore original positions
+            // Bricks were created in local coordinates, need to translate back to world space
+            // Brick position formula: scale * size + 2 * scale * pos
+            // So offset needs to be multiplied by 2 * scale to match the pos term
+            let brick_scale_factor = 2.0 * opts.brick_scale as f32;
+            for brick in &mut save_data.bricks {
+                brick.position.x += (world_offset.x * brick_scale_factor) as i32;
+                brick.position.y += (world_offset.y * brick_scale_factor) as i32;
+                brick.position.z += (world_offset.z * brick_scale_factor) as i32;
             }
 
+            let mat_elapsed = mat_start.elapsed();
+            
+            // Update running average of processing time
+            total_processing_time += mat_elapsed.as_secs_f32();
+            let materials_processed_so_far = mat_id + 1 - skipped_count;
+            if materials_processed_so_far > 0 {
+                avg_time_per_material = total_processing_time / materials_processed_so_far as f32;
+            }
+            
             if !save_data.bricks.is_empty() {
-                opts.logger.log(format!("Material {} generated {} bricks", mat_id, save_data.bricks.len()));
+                processed_count += 1;
+                opts.logger.log(format!("Material {} ({}, {} tris) -> {} bricks as {:?} in {:.2}s", 
+                    mat_id, mat_name, triangle_count, save_data.bricks.len(), brick_material, mat_elapsed.as_secs_f32()));
 
-                // Create a frozen grid entity for this material with user-defined offset
-                let offset_multiplier = mat_id as f32;
+                if opts.group_by_brick_material {
+                    // Consolidate bricks by Brickadia material type
+                    bricks_by_type.entry(brick_material).or_default().extend(save_data.bricks);
+                } else {
+                    // One grid per texture material (original behavior)
+                    let offset_multiplier = mat_id as f32;
+                    let entity = Entity {
+                        frozen: true,
+                        location: brdb::Vector3f {
+                            x: opts.grid_offset_x * offset_multiplier,
+                            y: opts.grid_offset_y * offset_multiplier,
+                            z: opts.grid_offset_z * offset_multiplier,
+                        },
+                        ..Default::default()
+                    };
+                    material_grids.push((entity, save_data.bricks));
+                }
+            } else {
+                debug_log(&opts.logger, format!("Material {} ({}) -> 0 bricks in {:.2}s (skipped)", 
+                    mat_id, mat_name, mat_elapsed.as_secs_f32()));
+            }
+        }
+
+        // If grouping by brick material type, create grids from the consolidated buckets
+        if opts.group_by_brick_material {
+            let mut type_index = 0;
+            for (brick_material, bricks) in bricks_by_type {
+                opts.logger.log(format!("Grid {:?} -> {} bricks", brick_material, bricks.len()));
                 let entity = Entity {
                     frozen: true,
                     location: brdb::Vector3f {
-                        x: opts.grid_offset_x * offset_multiplier,
-                        y: opts.grid_offset_y * offset_multiplier,
-                        z: opts.grid_offset_z * offset_multiplier,
+                        x: opts.grid_offset_x * type_index as f32,
+                        y: opts.grid_offset_y * type_index as f32,
+                        z: opts.grid_offset_z * type_index as f32,
                     },
                     ..Default::default()
                 };
+                material_grids.push((entity, bricks));
+                type_index += 1;
+            }
+            opts.logger.log(format!("Consolidated {} texture materials into {} grids by Brickadia material type", 
+                processed_count, material_grids.len()));
+        }
 
-                material_grids.push((entity, save_data.bricks));
+        // Log summary
+        opts.logger.log(format!("Processed {} materials -> {} grids ({} skipped early)", 
+            material_count, material_grids.len(), skipped_count));
+
+        // Save material cache if modified
+        if let Some(ref mapping) = cached_mapping {
+            if let Err(e) = mapping.save_cache() {
+                opts.logger.log(format!("Warning: Failed to save material cache: {}", e));
             } else {
-                opts.logger.log(format!("Material {} had no bricks, skipping", mat_id));
+                opts.logger.log(format!("Saved material cache ({} entries)", mapping.cache_size()));
             }
         }
 
@@ -1656,7 +2105,7 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
 fn load_models_and_materials(
     opt: &Obj2Brs,
     skip_textures: bool,
-) -> ConversionResult<(Vec<tobj::Model>, Vec<image::RgbaImage>)> {
+) -> ConversionResult<(Vec<tobj::Model>, Vec<image::RgbaImage>, Vec<String>)> {
     let p = Path::new(&opt.input_file_path);
 
     opt.logger.log("Importing model...".to_string());
@@ -1672,25 +2121,30 @@ fn load_models_and_materials(
     let (mut models, materials) = tobj::load_obj(&opt.input_file_path, &load_options)
         .map_err(|e| ConversionError::ObjParseError(e.to_string()))?;
 
-    // Debug: Log model statistics
+    // Log model statistics
     debug_log(&opt.logger, format!("Loaded {} model(s)", models.len()));
-    for (i, model) in models.iter().enumerate() {
-        let vertex_count = model.mesh.positions.len() / 3;
-        let face_count = model.mesh.indices.len() / 3;
-        debug_log(&opt.logger, format!("  Model {}: '{}' - {} vertices, {} faces", 
-            i, model.name, vertex_count, face_count));
+    if VERBOSE_MODEL_LOADING {
+        for (i, model) in models.iter().enumerate() {
+            let vertex_count = model.mesh.positions.len() / 3;
+            let face_count = model.mesh.indices.len() / 3;
+            debug_log(&opt.logger, format!("  Model {}: '{}' - {} vertices, {} faces", 
+                i, model.name, vertex_count, face_count));
+        }
     }
 
     opt.logger.log("Loading materials...".to_string());
     let mut material_images = Vec::<image::RgbaImage>::new();
+    let mut material_names = Vec::<String>::new();
 
     let materials = materials.unwrap_or_else(|_| Vec::new());
 
     if materials.is_empty() {
         opt.logger.log("  No materials found, using default white color".to_string());
         material_images.push(create_solid_color_texture([1.0, 1.0, 1.0], 1.0));
+        material_names.push("default".to_string());
     } else {
         for material in materials {
+            material_names.push(material.name.clone());
             // Try to load texture if available and not skipping
             if !skip_textures {
                 if let Some(ref texture_name) = material.diffuse_texture {
@@ -1705,10 +2159,12 @@ fn load_models_and_materials(
                         .ok_or_else(|| ConversionError::ObjFileNotFound { path: p.to_path_buf() })?
                         .join(texture_name);
 
-                    opt.logger.log(format!(
-                        "  Loading diffuse texture for {} from: {:?}",
-                        material.name, image_path
-                    ));
+                    if VERBOSE_TEXTURE_LOADING {
+                        opt.logger.log(format!(
+                            "  Loading diffuse texture for {} from: {}",
+                            material.name, image_path.display()
+                        ));
+                    }
 
                     // Try to load texture
                     match image::open(&image_path) {
@@ -1723,7 +2179,7 @@ fn load_models_and_materials(
                         }
                     }
                 } else {
-                    // No texture or empty texture name
+                    // No texture - always log missing textures
                     opt.logger.log(format!(
                         "  Material {} does not have a texture, using material color",
                         material.name
@@ -1734,10 +2190,12 @@ fn load_models_and_materials(
                 }
             } else {
                 // Skipping textures, use material color
-                opt.logger.log(format!(
-                    "  Skipping textures for material {}, using material color",
-                    material.name
-                ));
+                if VERBOSE_TEXTURE_LOADING {
+                    opt.logger.log(format!(
+                        "  Skipping textures for material {}, using material color",
+                        material.name
+                    ));
+                }
                 let diffuse = material.diffuse.unwrap_or([1.0, 1.0, 1.0]);
                 let dissolve = material.dissolve.unwrap_or(1.0);
                 material_images.push(create_solid_color_texture(diffuse, dissolve));
@@ -1758,9 +2216,9 @@ fn load_models_and_materials(
     }
 
     // Scale models (also centers at origin)
-    scale_models(&mut models, opt.scale, opt.scale_x, opt.scale_y, opt.scale_z);
+    scale_models(&mut models, opt.scale, opt.scale_x, opt.scale_y, opt.scale_z, &opt.logger);
 
-    Ok((models, material_images))
+    Ok((models, material_images, material_names))
 }
 
 fn check_model_bounds(models: &[tobj::Model], opt: &Obj2Brs) {
@@ -1803,7 +2261,7 @@ fn check_model_bounds(models: &[tobj::Model], opt: &Obj2Brs) {
             // Warn if model has very large coordinates (typical for BSP maps)
             if max_range > 10000.0 {
                 opt.logger.log(format!(
-                    "⚠ WARNING: Model is very large ({:.0} units). This may require significant memory.",
+                    "WARNING: Model is very large ({:.0} units). This may require significant memory.",
                     max_range
                 ));
                 opt.logger.log("Model will be centered at origin before scaling to optimize memory usage.".to_string());
@@ -1820,18 +2278,18 @@ fn check_model_bounds(models: &[tobj::Model], opt: &Obj2Brs) {
 /// Rotate models around X, Y, Z axes by the given angles (in degrees, must be 0, 90, 180, or 270).
 /// 
 /// The UI describes rotations in Brickadia coordinates (Z-up), but OBJ files use Y-up.
-/// Since the simplify code swaps Y↔Z when creating bricks, we need to swap the rotation axes:
-/// - UI "Rotation X" (Brickadia left-right) → OBJ X axis
-/// - UI "Rotation Y" (Brickadia forward-back) → OBJ Z axis (swapped)
-/// - UI "Rotation Z" (Brickadia up-down) → OBJ Y axis (swapped)
+/// Since the simplify code swaps Y<->Z when creating bricks, we need to swap the rotation axes:
+/// - UI "Rotation X" (Brickadia left-right) -> OBJ X axis
+/// - UI "Rotation Y" (Brickadia forward-back) -> OBJ Z axis (swapped)
+/// - UI "Rotation Z" (Brickadia up-down) -> OBJ Y axis (swapped)
 ///
 /// Rotation is applied in order: X, then Y (mapped to OBJ Z), then Z (mapped to OBJ Y).
 /// The model is first centered at the origin, rotated, then the center is preserved.
 fn rotate_models(models: &mut [tobj::Model], rot_x: i32, rot_y: i32, rot_z: i32) {
-    // Map Brickadia axes to OBJ axes (Y↔Z swap)
+    // Map Brickadia axes to OBJ axes (Y<->Z swap)
     let obj_rot_x = rot_x;  // X stays the same
-    let obj_rot_y = rot_z;  // Brickadia Z (up) → OBJ Y (up)
-    let obj_rot_z = rot_y;  // Brickadia Y (forward) → OBJ Z (forward)
+    let obj_rot_y = rot_z;  // Brickadia Z (up) -> OBJ Y (up)
+    let obj_rot_z = rot_y;  // Brickadia Y (forward) -> OBJ Z (forward)
     
     // First, find the center of the model's bounding box
     let (center_x, center_y, center_z) = if let Some(first_model) = models.first() {
@@ -1913,7 +2371,7 @@ fn rotate_2d(a: f32, b: f32, degrees: i32) -> (f32, f32) {
     }
 }
 
-fn scale_models(models: &mut [tobj::Model], scale: f32, scale_x: f32, scale_y: f32, scale_z: f32) {
+fn scale_models(models: &mut [tobj::Model], scale: f32, scale_x: f32, scale_y: f32, scale_z: f32, logger: &Logger) {
     // Apply base scale plus per-axis scale multipliers.
     // Note: scale_x/y/z are in Brickadia coordinates, but OBJ uses Y-up.
     // Since simplify swaps Y↔Z, we need to swap scale_y and scale_z here.
@@ -1971,23 +2429,40 @@ fn scale_models(models: &mut [tobj::Model], scale: f32, scale_x: f32, scale_y: f
         }
     }
 
-    // Raise mesh so no vertices are vertically negative
+    // Offset mesh so no vertices have negative coordinates
+    // This is critical because Brickadia doesn't handle negative brick positions correctly
     if let Some(first_model) = models.first() {
         let positions = &first_model.mesh.positions;
         if !positions.is_empty() {
+            let mut min_x = positions[0];
+            let mut min_y = positions[1];
             let mut min_z = positions[2];
+            
             for m in models.iter() {
                 let p = &m.mesh.positions;
                 for v in (0..p.len()).step_by(3) {
+                    min_x = min_x.min(p[v]);
+                    min_y = min_y.min(p[v + 1]);
                     min_z = min_z.min(p[v + 2]);
                 }
             }
 
-            if min_z < 0.0 {
-                let z_offset = -min_z;
+            // Calculate offsets needed to make all coordinates non-negative
+            let x_offset = if min_x < 0.0 { -min_x } else { 0.0 };
+            let y_offset = if min_y < 0.0 { -min_y } else { 0.0 };
+            let z_offset = if min_z < 0.0 { -min_z } else { 0.0 };
+
+            // Apply offsets if any axis has negative values
+            if x_offset > 0.0 || y_offset > 0.0 || z_offset > 0.0 {
+                debug_log(logger, format!(
+                    "Offsetting model to eliminate negative coordinates: X+{:.1}, Y+{:.1}, Z+{:.1}",
+                    x_offset, y_offset, z_offset
+                ));
                 for m in models.iter_mut() {
                     let p = &mut m.mesh.positions;
                     for v in (0..p.len()).step_by(3) {
+                        p[v] += x_offset;
+                        p[v + 1] += y_offset;
                         p[v + 2] += z_offset;
                     }
                 }
@@ -2077,7 +2552,7 @@ fn voxelize_models(
     });
     
     let start = std::time::Instant::now();
-    let result = voxelize_with_progress(models, material_images, opts.scale, opts.bricktype, material_filter, Some(progress.clone()));
+    let result = voxelize_with_progress(models, material_images, opts.scale, opts.bricktype, material_filter, Some(progress.clone()), Some(&opts.logger));
     let elapsed = start.elapsed();
     
     // Stop heartbeat thread
@@ -2102,7 +2577,7 @@ fn voxelize_models(
     
     if estimated_gb > 16.0 {
         opts.logger.log(format!(
-            "⚠ WARNING: Octree is very large ({}³ grid = {:.1} GB for simplification).",
+            "WARNING: Octree is very large ({}^3 grid = {:.1} GB for simplification).",
             grid_size, estimated_gb
         ));
         opts.logger.log("Simplification will be skipped to prevent memory overflow.".to_string());
@@ -2112,8 +2587,8 @@ fn voxelize_models(
 }
 
 fn generate_octree(opt: &Obj2Brs, skip_textures: bool, material_filter: Option<usize>) -> ConversionResult<octree::VoxelTree<Vector4<u8>>> {
-    opt.logger.log(format!("Loading {:?}", Path::new(&opt.input_file_path)));
-    let (mut models, material_images) = load_models_and_materials(opt, skip_textures)?;
+    opt.logger.log(format!("Loading {}", Path::new(&opt.input_file_path).display()));
+    let (mut models, material_images, _material_names) = load_models_and_materials(opt, skip_textures)?;
     Ok(voxelize_models(&mut models, &material_images, opt, material_filter))
 }
 
@@ -2140,7 +2615,7 @@ fn write_brz_data(octree: &mut octree::VoxelTree<Vector4<u8>>, opts: &Obj2Brs, m
     // If estimated memory > 16 GB, skip simplification and use direct brick generation
     if estimated_gb > 16.0 {
         opts.logger.log(format!(
-            "⚠ WARNING: Model is too large for simplification ({:.1} GB required).",
+            "WARNING: Model is too large for simplification ({:.1} GB required).",
             estimated_gb
         ));
         opts.logger.log("Generating bricks directly from octree (1 brick per voxel).".to_string());
@@ -2205,7 +2680,7 @@ fn write_brz_data(octree: &mut octree::VoxelTree<Vector4<u8>>, opts: &Obj2Brs, m
         Some(preview_bytes_jpg),
     )?;
 
-    opts.logger.log(format!("Save written to: {:?}", output_file_path));
+    opts.logger.log(format!("Save written to: {}", output_file_path.display()));
     Ok(())
 }
 
@@ -2231,7 +2706,7 @@ fn write_brz_with_grids(opts: &Obj2Brs, grids: Vec<(Entity, Vec<Brick>)>) -> Con
         Some(preview_bytes_jpg),
     )?;
 
-    opts.logger.log(format!("Save written to: {:?}", output_file_path));
+    opts.logger.log(format!("Save written to: {}", output_file_path.display()));
     Ok(())
 }
 
@@ -2278,7 +2753,7 @@ fn add_origin_marker(save_data: &mut SaveData, opts: &Obj2Brs) {
     let blue = Color::new(0, 0, 255);
 
     // Helper to create a marker brick
-    let mut create_marker = |x: i32, y: i32, z: i32, color: Color| -> Brick {
+    let create_marker = |x: i32, y: i32, z: i32, color: Color| -> Brick {
         Brick {
             id: None,
             asset: brick_type.clone(),
@@ -2321,20 +2796,20 @@ fn main() {
     // Log the data directory location
     let data_dir = logger::get_data_dir();
     let cache_dir = logger::get_cache_dir();
-    logger.log(format!("Data directory: {:?}", data_dir));
-    logger.log(format!("User cache: {:?}", cache_dir));
+    logger.log(format!("Data directory: {}", data_dir.display()));
+    logger.log(format!("User cache: {}", cache_dir.display()));
 
     let build_dir = match env::consts::OS {
         "windows" => {
             dirs::data_local_dir()
+                .map(|p| p.join("Brickadia").join("Saved").join("Builds"))
                 .and_then(|p| p.to_str().map(|s| s.to_string()))
-                .map(|s| s + "\\Brickadia\\Saved\\Builds")
                 .unwrap_or_else(|| "builds".to_string())
         }
         "linux" => {
             dirs::config_dir()
+                .map(|p| p.join("Epic").join("Brickadia").join("Saved").join("Builds"))
                 .and_then(|p| p.to_str().map(|s| s.to_string()))
-                .map(|s| s + "/Epic/Brickadia/Saved/Builds")
                 .unwrap_or_else(|| "builds".to_string())
         }
         _ => "builds".to_string(),

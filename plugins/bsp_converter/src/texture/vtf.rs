@@ -62,6 +62,7 @@ const IMAGE_FORMAT_UVLX8888: i32 = 26;
 
 /// VTF file header (version 7.0+)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct VtfHeader {
     signature: [u8; 4],
     version_major: u32,
@@ -122,8 +123,8 @@ pub fn load_vtf<P: AsRef<Path>>(path: P) -> BspResult<VtfTexture> {
     // Read version
     let mut version_buf = [0u8; 8];
     reader.read_exact(&mut version_buf)?;
-    let version_major = u32::from_le_bytes([version_buf[0], version_buf[1], version_buf[2], version_buf[3]]);
-    let version_minor = u32::from_le_bytes([version_buf[4], version_buf[5], version_buf[6], version_buf[7]]);
+    let _version_major = u32::from_le_bytes([version_buf[0], version_buf[1], version_buf[2], version_buf[3]]);
+    let _version_minor = u32::from_le_bytes([version_buf[4], version_buf[5], version_buf[6], version_buf[7]]);
 
     // Read header size
     let mut header_size_buf = [0u8; 4];
@@ -526,9 +527,10 @@ pub fn find_texture<P: AsRef<Path>>(texture_name: &str, search_dir: P) -> Option
     }
     
     // Try case-insensitive search in subdirectories
+    // Include materials/halflife for Source-style texture packs
     let lower_name = texture_name.to_lowercase();
     
-    for subdir in &["halflife", "decals", "liquids", ""] {
+    for subdir in &["materials/halflife", "halflife", "materials", "decals", "liquids", "textures", ""] {
         let dir = if subdir.is_empty() {
             search_dir.to_path_buf()
         } else {
