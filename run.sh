@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Launch script for obj2brs GUI
+# Launch script for obj2brz GUI
 # Runs the application from source code
 
 set -e  # Exit on error
 
 echo "==================================="
-echo "Launching obj2brs GUI..."
+echo "Launching obj2brz GUI..."
 echo "==================================="
 
 # Check if cargo is available
@@ -20,5 +20,5 @@ cargo run --release
 
 echo ""
 echo "==================================="
-echo "obj2brs GUI closed"
+echo "obj2brz GUI closed"
 echo "==================================="

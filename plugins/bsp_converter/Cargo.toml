@@ -2,8 +2,8 @@
 name = "bsp_converter"
 version = "0.1.0"
 edition = "2021"
-description = "Rust-based BSP to OBJ converter for Brickadia obj2brs pipeline"
-authors = ["obj2brs contributors"]
+description = "Rust-based BSP to OBJ converter for Brickadia obj2brz pipeline"
+authors = ["obj2brz contributors"]
 
 [features]
 default = []

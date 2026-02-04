@@ -91,7 +91,7 @@ impl Default for ColorMode {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Obj2Brs {
+pub struct Obj2Brz {
     pub bricktype: BrickType,
     pub brick_scale: isize,
     #[serde(skip)]
@@ -256,7 +256,7 @@ pub enum Material {
     Ghost,
 }
 
-impl Default for Obj2Brs {
+impl Default for Obj2Brz {
     fn default() -> Self {
         // Get auto-suggested paths from data directory
         let imports_dir = logger::get_imports_dir();
@@ -323,7 +323,7 @@ impl Default for Obj2Brs {
     }
 }
 
-impl App for Obj2Brs {
+impl App for Obj2Brz {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, self);
     }
@@ -472,7 +472,7 @@ impl App for Obj2Brs {
     }
 }
 
-impl Obj2Brs {
+impl Obj2Brz {
     /// Update detected file type and game source based on input path.
     fn update_input_file_type(&mut self) {
         let path = Path::new(&self.input_file_path);
@@ -1566,7 +1566,7 @@ impl Obj2Brs {
             set_prog(25, "Converting OBJ to BRZ...");
             logger.log("Converting OBJ to BRZ...".to_string());
 
-            let opts = Obj2Brs {
+            let opts = Obj2Brz {
                 bricktype,
                 brick_scale,
                 input_file_path_receiver: None,
@@ -1684,8 +1684,8 @@ impl Obj2Brs {
 
         // Spawn background thread for conversion
         thread::spawn(move || {
-            // Create a minimal Obj2Brs for the conversion functions
-            let opts = Obj2Brs {
+            // Create a minimal Obj2Brz for the conversion functions
+            let opts = Obj2Brz {
                 bricktype,
                 brick_scale,
                 input_file_path_receiver: None,
@@ -1854,7 +1854,7 @@ fn validate_obj_resources(obj_path: &str) -> ConversionResult<MissingResources> 
     Ok(missing)
 }
 
-fn set_progress(opts: &Obj2Brs, percent: u32, stage: &str) {
+fn set_progress(opts: &Obj2Brz, percent: u32, stage: &str) {
     opts.conversion_progress.store(percent, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut s) = opts.conversion_stage.lock() {
         *s = stage.to_string();
@@ -1862,7 +1862,7 @@ fn set_progress(opts: &Obj2Brs, percent: u32, stage: &str) {
 }
 
 /// Check if the conversion has been cancelled
-fn is_cancelled(opts: &Obj2Brs) -> bool {
+fn is_cancelled(opts: &Obj2Brz) -> bool {
     opts.conversion_cancelled.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -1886,7 +1886,7 @@ fn format_number(n: usize) -> String {
     result.chars().rev().collect()
 }
 
-fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<()> {
+fn perform_conversion(opts: &Obj2Brz, skip_textures: bool) -> ConversionResult<()> {
     if is_cancelled(opts) {
         opts.logger.log("Conversion cancelled.".to_string());
         return Ok(());
@@ -2065,7 +2065,9 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
 
             // Voxelize using pre-grouped triangles (much faster than re-parsing models)
             // Returns (octree, world_offset) - we need to add world_offset back to brick positions
-            let (mut octree, world_offset) = voxelize_from_pregrouped(&pregrouped, &material_images, mat_id, None, Some(&opts.logger));
+            // Use global_min as reference point so all materials align correctly in world space
+            // This ensures materials are positioned relative to the same origin point
+            let (mut octree, world_offset) = voxelize_from_pregrouped(&pregrouped, &material_images, mat_id, Some(pregrouped.global_min), None, Some(&opts.logger));
             
             // Log voxelization results
             debug_log(&opts.logger, format!("Material {} ({}) voxelized: octree size {}, offset({:.1},{:.1},{:.1})", 
@@ -2268,7 +2270,7 @@ fn perform_conversion(opts: &Obj2Brs, skip_textures: bool) -> ConversionResult<(
 }
 
 fn load_models_and_materials(
-    opt: &Obj2Brs,
+    opt: &Obj2Brz,
     skip_textures: bool,
 ) -> ConversionResult<(Vec<tobj::Model>, Vec<image::RgbaImage>, Vec<String>)> {
     let p = Path::new(&opt.input_file_path);
@@ -2386,7 +2388,7 @@ fn load_models_and_materials(
     Ok((models, material_images, material_names))
 }
 
-fn check_model_bounds(models: &[tobj::Model], opt: &Obj2Brs) {
+fn check_model_bounds(models: &[tobj::Model], opt: &Obj2Brz) {
     if let Some(first_model) = models.first() {
         let positions = &first_model.mesh.positions;
         if !positions.is_empty() {
@@ -2639,7 +2641,7 @@ fn scale_models(models: &mut [tobj::Model], scale: f32, scale_x: f32, scale_y: f
 fn voxelize_models(
     models: &mut [tobj::Model],
     material_images: &[image::RgbaImage],
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     material_filter: Option<usize>,
 ) -> octree::VoxelTree<Vector4<u8>> {
     // Calculate model statistics for progress estimation
@@ -2751,13 +2753,13 @@ fn voxelize_models(
     result
 }
 
-fn generate_octree(opt: &Obj2Brs, skip_textures: bool, material_filter: Option<usize>) -> ConversionResult<octree::VoxelTree<Vector4<u8>>> {
+fn generate_octree(opt: &Obj2Brz, skip_textures: bool, material_filter: Option<usize>) -> ConversionResult<octree::VoxelTree<Vector4<u8>>> {
     opt.logger.log(format!("Loading {}", Path::new(&opt.input_file_path).display()));
     let (mut models, material_images, _material_names) = load_models_and_materials(opt, skip_textures)?;
     Ok(voxelize_models(&mut models, &material_images, opt, material_filter))
 }
 
-fn write_brz_data(octree: &mut octree::VoxelTree<Vector4<u8>>, opts: &Obj2Brs, material_id: Option<usize>) -> ConversionResult<()> {
+fn write_brz_data(octree: &mut octree::VoxelTree<Vector4<u8>>, opts: &Obj2Brz, material_id: Option<usize>) -> ConversionResult<()> {
     let max_merge = 500;
 
     let mut save_data = SaveData {
@@ -2853,7 +2855,7 @@ fn write_brz_data(octree: &mut octree::VoxelTree<Vector4<u8>>, opts: &Obj2Brs, m
     Ok(())
 }
 
-fn write_brz_with_grids(opts: &Obj2Brs, mut grids: Vec<(Entity, Vec<Brick>)>) -> ConversionResult<()> {
+fn write_brz_with_grids(opts: &Obj2Brz, mut grids: Vec<(Entity, Vec<Brick>)>) -> ConversionResult<()> {
     opts.logger.log(format!("Writing {} frozen grids...", grids.len()));
 
     // Apply color merging to each grid if enabled
@@ -2903,7 +2905,7 @@ fn write_brz_with_grids(opts: &Obj2Brs, mut grids: Vec<(Entity, Vec<Brick>)>) ->
 /// - Red bricks along +X axis
 /// - Green bricks along +Y axis  
 /// - Blue bricks along +Z axis
-fn add_origin_marker(save_data: &mut SaveData, opts: &Obj2Brs) {
+fn add_origin_marker(save_data: &mut SaveData, opts: &Obj2Brz) {
     use brdb::{Brick, BrickSize, BrickType as BrdbBrickType, Color, Direction, Position, Rotation};
 
     // Determine brick size based on brick type
@@ -2978,7 +2980,7 @@ fn add_origin_marker(save_data: &mut SaveData, opts: &Obj2Brs) {
 }
 
 /// Create origin marker bricks and return them as a Vec (for split-by-material path)
-fn create_origin_marker_bricks(opts: &Obj2Brs) -> Vec<Brick> {
+fn create_origin_marker_bricks(opts: &Obj2Brz) -> Vec<Brick> {
     use brdb::{Brick, BrickSize, BrickType as BrdbBrickType, Color, Direction, Position, Rotation};
 
     let mut bricks = Vec::new();
@@ -3106,13 +3108,13 @@ fn main() {
         Box::new(move |cc| {
             // Load previous state if available
             let mut app = if let Some(storage) = cc.storage {
-                eframe::get_value(storage, eframe::APP_KEY).unwrap_or_else(|| Obj2Brs {
+                eframe::get_value(storage, eframe::APP_KEY).unwrap_or_else(|| Obj2Brz {
                     output_directory: build_dir_clone.clone(),
                     logger: logger.clone(),
                     ..Default::default()
                 })
             } else {
-                Obj2Brs {
+                Obj2Brz {
                     output_directory: build_dir_clone.clone(),
                     logger: logger.clone(),
                     ..Default::default()

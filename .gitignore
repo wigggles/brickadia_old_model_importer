@@ -34,3 +34,6 @@ data/game_textures/
 
 # but keep the README file
 !data/game_textures/README.md
+
+# don't keep analysis related materials
+docs/analysis

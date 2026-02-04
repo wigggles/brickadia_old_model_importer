@@ -1,6 +1,6 @@
 # Plugins
 
-This directory contains Rust-based conversion plugins that extend the `obj2brs` pipeline.
+This directory contains Rust-based conversion plugins that extend the `obj2brz` pipeline.
 
 ## Purpose
 
@@ -8,7 +8,7 @@ The goal is to provide native Rust implementations of format converters (e.g., B
 
 1. The entire pipeline from source format → OBJ → Brickadia `.brz` can be built with a single toolchain (Rust/Cargo).
 2. No external C#/.NET dependencies are required at runtime.
-3. Code can be shared/integrated more easily with the main `obj2brs` crate if desired.
+3. Code can be shared/integrated more easily with the main `obj2brz` crate if desired.
 
 ## Current plugins
 

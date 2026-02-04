@@ -361,10 +361,14 @@ pub fn voxelize_with_progress(
 /// Uses per-material bounds with coordinate translation for efficient octree sizing.
 /// Returns (octree, world_offset) where world_offset is the translation that was applied.
 /// Caller must add world_offset back to brick positions to restore world coordinates.
+/// 
+/// If global_offset is provided, uses that instead of per-material bounds.min for coordinate translation.
+/// This ensures all materials share the same coordinate system (important for split-by-material mode).
 pub fn voxelize_from_pregrouped(
     pregrouped: &PreGroupedTriangles,
     materials: &[RgbaImage],
     material_id: usize,
+    global_offset: Option<Vector3<f32>>,
     progress: Option<Arc<VoxelizeProgress>>,
     _logger: Option<&Logger>,
 ) -> (VoxelTree<Vector4<u8>>, Vector3<f32>) {
@@ -383,16 +387,19 @@ pub fn voxelize_from_pregrouped(
         None => return (octree, zero_offset),
     };
     
-    // Store the offset we're applying (bounds.min) so caller can add it back to bricks
-    let world_offset = bounds.min;
+    // Determine which offset to use for coordinate translation
+    // If global_offset is provided, all materials use the same coordinate system
+    // Otherwise, each material uses its own bounds.min for efficient octree sizing
+    let translation_offset = global_offset.unwrap_or(bounds.min);
+    let world_offset = translation_offset;
     
-    // Translate triangles so their bounds start near origin
-    // This allows us to use a small octree sized to just this material's geometry
+    // Translate triangles by the chosen offset
+    // This allows us to use a small octree sized appropriately
     let triangles: Vec<Triangle> = original_triangles.iter().map(|t| {
         let mut translated = *t;
-        translated.vertices[0] -= bounds.min;
-        translated.vertices[1] -= bounds.min;
-        translated.vertices[2] -= bounds.min;
+        translated.vertices[0] -= translation_offset;
+        translated.vertices[1] -= translation_offset;
+        translated.vertices[2] -= translation_offset;
         translated.aabb = AABB::from_triangle(
             translated.vertices[0],
             translated.vertices[1],
@@ -401,14 +408,37 @@ pub fn voxelize_from_pregrouped(
         translated
     }).collect();
     
-    // Calculate bounds for translated triangles (now starting near origin)
-    let size = bounds.max - bounds.min;
-    let floor_min = Vector3::<isize>::new(0, 0, 0);
-    let ceil_max = Vector3::<isize>::new(
-        size[0].ceil() as isize + 1,
-        size[1].ceil() as isize + 1,
-        size[2].ceil() as isize + 1,
-    );
+    // Calculate bounds for translated triangles
+    // When using global_offset, bounds are relative to global origin
+    // When using per-material bounds.min, bounds start near origin (0,0,0)
+    let (floor_min, ceil_max) = if global_offset.is_some() {
+        // Global offset mode: calculate actual translated bounds
+        let translated_min = bounds.min - translation_offset;
+        let translated_max = bounds.max - translation_offset;
+        (
+            Vector3::<isize>::new(
+                translated_min[0].floor() as isize - 1,
+                translated_min[1].floor() as isize - 1,
+                translated_min[2].floor() as isize - 1,
+            ),
+            Vector3::<isize>::new(
+                translated_max[0].ceil() as isize + 1,
+                translated_max[1].ceil() as isize + 1,
+                translated_max[2].ceil() as isize + 1,
+            )
+        )
+    } else {
+        // Per-material mode: bounds start near origin for efficient octree sizing
+        let size = bounds.max - bounds.min;
+        (
+            Vector3::<isize>::new(0, 0, 0),
+            Vector3::<isize>::new(
+                size[0].ceil() as isize + 1,
+                size[1].ceil() as isize + 1,
+                size[2].ceil() as isize + 1,
+            )
+        )
+    };
     
     while !octree.contains_bounds(floor_min) || !octree.contains_bounds(ceil_max) {
         octree.size += 1;

@@ -1,4 +1,4 @@
-# obj2brs
+# obj2brz
 
 a5 adaptation of [textured-voxelizer](https://github.com/CheezBarger/textured-voxelizer) by Suficio
 
@@ -33,7 +33,7 @@ cargo build --release
 Then run:
 
 ```powershell
-./target/release/obj2brs.exe
+./target/release/obj2brz.exe
 ```
 
 ## Build scripts

@@ -1,7 +1,7 @@
 use crate::color::*;
 use crate::logger::Logger;
 use crate::octree::{Branches, TreeBody, VoxelTree};
-use crate::{BrickType, Material, Obj2Brs, SaveData};
+use crate::{BrickType, Material, Obj2Brz, SaveData};
 
 use brdb::{Brick, BrickSize, BrickType as BrdbBrickType, Color, Direction, Position, Rotation};
 use cgmath::Vector4;
@@ -161,7 +161,7 @@ impl VoxelGrid {
 pub fn simplify_lossy(
     octree: &mut VoxelTree<Vector4<u8>>,
     save_data: &mut SaveData,
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     max_merge: isize,
 ) {
     // Convert octree to flat grid for O(1) access
@@ -298,7 +298,7 @@ pub fn simplify_lossy(
 pub fn simplify_lossless(
     octree: &mut VoxelTree<Vector4<u8>>,
     save_data: &mut SaveData,
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     max_merge: isize,
 ) {
     // Convert octree to flat grid for O(1) access
@@ -448,7 +448,7 @@ pub fn simplify_lossless(
 
 #[allow(dead_code)]
 fn create_brick(
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     palette: &[Color],
     scale: (isize, isize, isize),
     size: (isize, isize, isize),
@@ -463,7 +463,7 @@ fn create_brick(
 /// Create a brick with explicit control over whether it should be smooth.
 /// is_top_surface: when true and use_smooth_bricks is enabled, uses smooth tile instead of studded brick
 fn create_brick_with_surface(
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     palette: &[Color],
     scale: (isize, isize, isize),
     size: (isize, isize, isize),
@@ -477,7 +477,7 @@ fn create_brick_with_surface(
 }
 
 fn create_brick_internal(
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     palette: &[Color],
     scale: (isize, isize, isize),
     size: (isize, isize, isize),
@@ -544,7 +544,7 @@ fn create_brick_internal(
 /// Create a brick with a specific material and intensity override (for material mapping).
 #[allow(dead_code)]
 fn create_brick_with_material(
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     palette: &[Color],
     scale: (isize, isize, isize),
     size: (isize, isize, isize),
@@ -558,7 +558,7 @@ fn create_brick_with_material(
 
 /// Create a brick with material override and explicit surface control.
 fn create_brick_with_material_and_surface(
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     palette: &[Color],
     scale: (isize, isize, isize),
     size: (isize, isize, isize),
@@ -573,7 +573,7 @@ fn create_brick_with_material_and_surface(
 }
 
 fn create_brick_with_material_internal(
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     palette: &[Color],
     scale: (isize, isize, isize),
     size: (isize, isize, isize),
@@ -643,7 +643,7 @@ fn create_brick_with_material_internal(
 pub fn simplify_lossy_with_material(
     octree: &mut VoxelTree<Vector4<u8>>,
     save_data: &mut SaveData,
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     max_merge: isize,
     material: Material,
     intensity: u8,
@@ -782,7 +782,7 @@ pub fn simplify_lossy_with_material(
 pub fn simplify_lossless_with_material(
     octree: &mut VoxelTree<Vector4<u8>>,
     save_data: &mut SaveData,
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     max_merge: isize,
     material: Material,
     intensity: u8,

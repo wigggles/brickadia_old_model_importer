@@ -1,4 +1,4 @@
-use crate::{Obj2Brs, SaveData};
+use crate::{Obj2Brz, SaveData};
 use crate::error::{ConversionError, ConversionResult};
 use std::path::PathBuf;
 use brdb::{Entity, World};
@@ -6,7 +6,7 @@ use brdb::{Entity, World};
 pub fn write_brz(
     path: PathBuf,
     data: &SaveData,
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     _use_procedural: bool,
     preview_image: Option<Vec<u8>>,
 ) -> ConversionResult<()> {
@@ -44,7 +44,7 @@ pub fn write_brz(
 pub fn write_brz_grids(
     path: PathBuf,
     grids: Vec<(Entity, Vec<brdb::Brick>)>,
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     preview_image: Option<Vec<u8>>,
 ) -> ConversionResult<()> {
     let mut world = World::new();

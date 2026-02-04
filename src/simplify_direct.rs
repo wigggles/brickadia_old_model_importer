@@ -1,6 +1,6 @@
 use crate::color::*;
 use crate::octree::{Branches, TreeBody, VoxelTree};
-use crate::{BrickType, Obj2Brs, SaveData};
+use crate::{BrickType, Obj2Brz, SaveData};
 
 use brdb::{Brick, BrickSize, BrickType as BrdbBrickType, Color, Direction, Position, Rotation};
 use cgmath::Vector4;
@@ -10,7 +10,7 @@ use cgmath::Vector4;
 pub fn generate_bricks_direct(
     octree: &VoxelTree<Vector4<u8>>,
     save_data: &mut SaveData,
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
 ) {
     let scales: (isize, isize, isize) = if opts.bricktype == BrickType::Microbricks {
         (opts.brick_scale, opts.brick_scale, opts.brick_scale)
@@ -44,7 +44,7 @@ fn traverse_and_generate(
     base_z: isize,
     palette: &[Color],
     scales: (isize, isize, isize),
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     save_data: &mut SaveData,
 ) {
     let m = mask >> 1;
@@ -82,7 +82,7 @@ fn traverse_and_generate(
 }
 
 fn create_brick(
-    opts: &Obj2Brs,
+    opts: &Obj2Brz,
     palette: &[Color],
     scale: (isize, isize, isize),
     size: (isize, isize, isize),

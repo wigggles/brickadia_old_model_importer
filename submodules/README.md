@@ -34,7 +34,7 @@ bsp2obj -g hl1 -o output_name -m path/to/map.bsp -c path/to/palette.lmp
 If you have a source map in a supported BSP format, you can:
 
 1. Convert BSP -> OBJ (and extract textures) using this submodule.
-2. Feed the resulting OBJ (+ textures/materials) into `obj2brs` to produce a Brickadia `.brz` build.
+2. Feed the resulting OBJ (+ textures/materials) into `obj2brz` to produce a Brickadia `.brz` build.
 
 ## Notes
 
