@@ -1,7 +1,6 @@
-use crate::color::*;
-use crate::logger::Logger;
-use crate::octree::{Branches, TreeBody, VoxelTree};
-use crate::{BrickType, Material, Obj2Brz, SaveData};
+use crate::color::utils::*;
+use crate::app::{BrickType, Material, Obj2Brz, SaveData, Logger};
+use crate::voxel::{Branches, TreeBody, VoxelTree};
 
 use brdb::{Brick, BrickSize, BrickType as BrdbBrickType, Color, Direction, Position, Rotation};
 use cgmath::Vector4;
@@ -64,11 +63,11 @@ impl VoxelGrid {
                 min_x, max_x, min_y, max_y, min_z, max_z));
             
             // Warn if negative coordinates detected (blocks will be at negative positions)
-            if min_x < 0 || min_y < 0 || min_z < 0 {
-                logger.log(format!("[WARNING] Negative voxel coordinates detected! Blocks may be placed at negative positions."));
-                logger.log(format!("[WARNING] This can cause issues when 'Split by Material' is enabled."));
-                logger.log(format!("[WARNING] Consider adjusting Grid Offset settings to ensure positive placement."));
-            }
+            //if min_x < 0 || min_y < 0 || min_z < 0 {
+            //    logger.log(format!("[WARNING] Negative voxel coordinates detected! Blocks may be placed at negative positions."));
+            //    logger.log(format!("[WARNING] This can cause issues when 'Split by Material' is enabled."));
+            //    logger.log(format!("[WARNING] Consider adjusting Grid Offset settings to ensure positive placement."));
+            //}
         }
         
         Self { data, size, offset }
@@ -529,12 +528,12 @@ fn create_brick_internal(
         visible: true,
         color: brick_color,
         material: match opts.material {
-            crate::Material::Plastic => "BMC_Plastic".into(),
-            crate::Material::Glass => "BMC_Glass".into(),
-            crate::Material::Glow => "BMC_Glow".into(),
-            crate::Material::Metallic => "BMC_Metallic".into(),
-            crate::Material::Hologram => "BMC_Hologram".into(),
-            crate::Material::Ghost => "BMC_Ghost".into(),
+            Material::Plastic => "BMC_Plastic".into(),
+            Material::Glass => "BMC_Glass".into(),
+            Material::Glow => "BMC_Glow".into(),
+            Material::Metallic => "BMC_Metallic".into(),
+            Material::Hologram => "BMC_Hologram".into(),
+            Material::Ghost => "BMC_Ghost".into(),
         },
         material_intensity: opts.material_intensity as u8,
         components: Vec::new(),

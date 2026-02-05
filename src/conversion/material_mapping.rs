@@ -8,7 +8,7 @@
 //! A cache file (material_cache.yaml) stores resolved texture->material mappings
 //! for faster consecutive runs.
 
-use crate::Material;
+use crate::app::Material;
 use bsp_converter::GameSource;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

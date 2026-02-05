@@ -37,3 +37,4 @@ data/game_textures/
 
 # don't keep analysis related materials
 docs/analysis
+docs/design_patterns

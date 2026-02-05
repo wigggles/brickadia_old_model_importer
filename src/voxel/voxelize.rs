@@ -1,9 +1,7 @@
-use crate::barycentric::interpolate_uv;
-use crate::color::*;
-use crate::logger::Logger;
-use crate::BrickType;
-use crate::intersect::intersect;
-use crate::octree::{Branches, TreeBody, VoxelTree};
+use crate::geometry::{interpolate_uv, intersect};
+use crate::color::utils::*;
+use crate::app::{BrickType, Logger};
+use super::octree::{Branches, TreeBody, VoxelTree};
 
 use cgmath::{Vector2, Vector3, Vector4};
 use image::RgbaImage;
@@ -48,6 +46,12 @@ impl AABB {
         self.max.z >= cube_min.z && self.min.z <= cube_max.z
     }
 
+    /// Get the maximum dimension of the AABB (for filtering small triangles)
+    fn max_dimension(&self) -> f32 {
+        let size = self.max - self.min;
+        size.x.max(size.y).max(size.z)
+    }
+
     /// Translate the AABB by subtracting an offset (for recursive subdivision)
     fn translated(&self, offset: Vector3<f32>) -> Self {
         Self {
@@ -81,8 +85,10 @@ pub struct PreGroupedTriangles {
     pub by_material: HashMap<Option<usize>, Vec<Triangle>>,
     /// Per-material bounding boxes for efficient octree sizing
     pub bounds_by_material: HashMap<Option<usize>, MaterialBounds>,
-    /// Global bounding box for all triangles
+    /// Global bounding box for all triangles (kept for potential future alignment features)
+    #[allow(dead_code)]
     pub global_min: Vector3<f32>,
+    #[allow(dead_code)]
     pub global_max: Vector3<f32>,
     /// Total triangle count
     pub total_count: usize,
@@ -255,9 +261,9 @@ pub fn voxelize_with_progress(
     }
 
     let floor_min = Vector3::<isize>::new(
-        min[0].floor() as isize - 1,
-        min[1].floor() as isize - 1,
-        min[2].floor() as isize - 1,
+        min[0].floor() as isize,
+        min[1].floor() as isize,
+        min[2].floor() as isize,
     );
     let ceil_max = Vector3::<isize>::new(
         max[0].ceil() as isize + 1,
@@ -334,6 +340,15 @@ pub fn voxelize_with_progress(
             };
 
             let aabb = AABB::from_triangle(v0, v1, v2);
+            
+            // Filter out triangles smaller than a voxel (sub-brick geometry)
+            // This reduces memory usage and processing time significantly
+            // Threshold: 0.5 voxels - triangles smaller than half a voxel won't contribute meaningfully
+            let min_triangle_size = 0.5;
+            if aabb.max_dimension() < min_triangle_size {
+                continue;
+            }
+            
             let triangle = Triangle {
                 material_id: material,
                 vertices: [v0, v1, v2],
@@ -361,14 +376,21 @@ pub fn voxelize_with_progress(
 /// Uses per-material bounds with coordinate translation for efficient octree sizing.
 /// Returns (octree, world_offset) where world_offset is the translation that was applied.
 /// Caller must add world_offset back to brick positions to restore world coordinates.
-/// 
-/// If global_offset is provided, uses that instead of per-material bounds.min for coordinate translation.
-/// This ensures all materials share the same coordinate system (important for split-by-material mode).
+///
+/// ## Design Note
+///
+/// This function ALWAYS uses per-material bounds for octree sizing. This is critical for
+/// performance - a material at Z=500 with size 10x10x10 gets octree size 4 (efficient),
+/// not size 10 (which would take 750+ seconds).
+///
+/// World alignment is handled by the caller adding `world_offset` back to brick positions.
+/// This separation of concerns prevents the V3 regression where attempting to fix alignment
+/// by changing octree sizing caused processing times to explode from 43 minutes to days.
 pub fn voxelize_from_pregrouped(
     pregrouped: &PreGroupedTriangles,
     materials: &[RgbaImage],
     material_id: usize,
-    global_offset: Option<Vector3<f32>>,
+    _global_offset: Option<Vector3<f32>>, // DEPRECATED: kept for API compatibility, always ignored
     progress: Option<Arc<VoxelizeProgress>>,
     _logger: Option<&Logger>,
 ) -> (VoxelTree<Vector4<u8>>, Vector3<f32>) {
@@ -387,14 +409,12 @@ pub fn voxelize_from_pregrouped(
         None => return (octree, zero_offset),
     };
     
-    // Determine which offset to use for coordinate translation
-    // If global_offset is provided, all materials use the same coordinate system
-    // Otherwise, each material uses its own bounds.min for efficient octree sizing
-    let translation_offset = global_offset.unwrap_or(bounds.min);
-    let world_offset = translation_offset;
+    // ALWAYS use per-material bounds.min for translation
+    // This keeps octrees small and efficient (size 3-6 instead of 9-10)
+    let translation_offset = bounds.min;
+    let world_offset = bounds.min;
     
-    // Translate triangles by the chosen offset
-    // This allows us to use a small octree sized appropriately
+    // Translate triangles to local coordinates (near origin)
     let triangles: Vec<Triangle> = original_triangles.iter().map(|t| {
         let mut translated = *t;
         translated.vertices[0] -= translation_offset;
@@ -409,36 +429,14 @@ pub fn voxelize_from_pregrouped(
     }).collect();
     
     // Calculate bounds for translated triangles
-    // When using global_offset, bounds are relative to global origin
-    // When using per-material bounds.min, bounds start near origin (0,0,0)
-    let (floor_min, ceil_max) = if global_offset.is_some() {
-        // Global offset mode: calculate actual translated bounds
-        let translated_min = bounds.min - translation_offset;
-        let translated_max = bounds.max - translation_offset;
-        (
-            Vector3::<isize>::new(
-                translated_min[0].floor() as isize - 1,
-                translated_min[1].floor() as isize - 1,
-                translated_min[2].floor() as isize - 1,
-            ),
-            Vector3::<isize>::new(
-                translated_max[0].ceil() as isize + 1,
-                translated_max[1].ceil() as isize + 1,
-                translated_max[2].ceil() as isize + 1,
-            )
-        )
-    } else {
-        // Per-material mode: bounds start near origin for efficient octree sizing
-        let size = bounds.max - bounds.min;
-        (
-            Vector3::<isize>::new(0, 0, 0),
-            Vector3::<isize>::new(
-                size[0].ceil() as isize + 1,
-                size[1].ceil() as isize + 1,
-                size[2].ceil() as isize + 1,
-            )
-        )
-    };
+    // Bounds start near origin (0,0,0) for efficient octree sizing
+    let size = bounds.max - bounds.min;
+    let floor_min = Vector3::<isize>::new(0, 0, 0);
+    let ceil_max = Vector3::<isize>::new(
+        size[0].ceil() as isize + 1,
+        size[1].ceil() as isize + 1,
+        size[2].ceil() as isize + 1,
+    );
     
     while !octree.contains_bounds(floor_min) || !octree.contains_bounds(ceil_max) {
         octree.size += 1;

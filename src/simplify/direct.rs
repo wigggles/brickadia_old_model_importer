@@ -1,6 +1,6 @@
-use crate::color::*;
-use crate::octree::{Branches, TreeBody, VoxelTree};
-use crate::{BrickType, Obj2Brz, SaveData};
+use crate::color::utils::*;
+use crate::app::{BrickType, Material, Obj2Brz, SaveData};
+use crate::voxel::{Branches, TreeBody, VoxelTree};
 
 use brdb::{Brick, BrickSize, BrickType as BrdbBrickType, Color, Direction, Position, Rotation};
 use cgmath::Vector4;
@@ -96,9 +96,9 @@ fn create_brick(
     );
 
     let position = Position {
-        x: (scale.0 * size.0 + 2 * scale.0 * pos.0) as i32,
-        y: (scale.1 * size.1 + 2 * scale.1 * pos.1) as i32,
-        z: (scale.2 * size.2 + 2 * scale.2 * pos.2) as i32,
+        x: (2 * scale.0 * pos.0) as i32,
+        y: (2 * scale.1 * pos.1) as i32,
+        z: (2 * scale.2 * pos.2) as i32,
     };
 
     let asset_name = if opts.bricktype == BrickType::Microbricks {
@@ -136,12 +136,12 @@ fn create_brick(
         visible: true,
         color: brick_color,
         material: match opts.material {
-            crate::Material::Plastic => "BMC_Plastic".into(),
-            crate::Material::Glass => "BMC_Glass".into(),
-            crate::Material::Glow => "BMC_Glow".into(),
-            crate::Material::Metallic => "BMC_Metallic".into(),
-            crate::Material::Hologram => "BMC_Hologram".into(),
-            crate::Material::Ghost => "BMC_Ghost".into(),
+            Material::Plastic => "BMC_Plastic".into(),
+            Material::Glass => "BMC_Glass".into(),
+            Material::Glow => "BMC_Glow".into(),
+            Material::Metallic => "BMC_Metallic".into(),
+            Material::Hologram => "BMC_Hologram".into(),
+            Material::Ghost => "BMC_Ghost".into(),
         },
         material_intensity: opts.material_intensity as u8,
         components: Vec::new(),

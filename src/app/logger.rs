@@ -53,6 +53,52 @@ pub fn get_logs_dir() -> PathBuf {
     get_cache_dir().join("logs")
 }
 
+/// Get the resources directory for the application.
+/// 
+/// Priority order:
+/// 1. Current working directory + "res/" (for development/source runs)
+/// 2. Executable directory + "res/" (for distributed builds)
+/// 3. Fallback to just "res" relative path
+pub fn get_res_dir() -> PathBuf {
+    // First, check if res/ exists in current working directory (development mode)
+    let cwd_res = PathBuf::from("res");
+    if cwd_res.exists() && cwd_res.is_dir() {
+        return cwd_res;
+    }
+
+    // Next, try executable's directory (distributed mode)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let exe_res = exe_dir.join("res");
+            if exe_res.exists() && exe_res.is_dir() {
+                return exe_res;
+            }
+        }
+    }
+
+    // Fallback to current working directory
+    PathBuf::from("res")
+}
+
+/// Get the path to the preview icon used in BRZ files.
+/// Returns the path to res/obj_icon.png
+pub fn get_preview_icon_path() -> PathBuf {
+    get_res_dir().join("obj_icon.png")
+}
+
+/// Load the preview icon bytes from the res directory.
+/// Falls back to embedded default if file not found.
+pub fn load_preview_icon() -> Vec<u8> {
+    let icon_path = get_preview_icon_path();
+    if icon_path.exists() {
+        if let Ok(bytes) = std::fs::read(&icon_path) {
+            return bytes;
+        }
+    }
+    // Fallback to embedded default
+    include_bytes!("../../res/obj_icon.png").to_vec()
+}
+
 /// Ensure all data directories exist
 pub fn ensure_data_dirs() -> std::io::Result<()> {
     create_dir_all(get_imports_dir())?;

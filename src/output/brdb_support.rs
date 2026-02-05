@@ -1,4 +1,4 @@
-use crate::{Obj2Brz, SaveData};
+use crate::app::{Obj2Brz, SaveData};
 use crate::error::{ConversionError, ConversionResult};
 use std::path::PathBuf;
 use brdb::{Entity, World};
@@ -22,7 +22,7 @@ pub fn write_brz(
         world.meta.bundle.name = stem.to_string_lossy().to_string();
     }
     world.meta.bundle.authors = vec![data.author_name.clone()];
-    world.meta.bundle.description = "Converted with obj2brz".to_string();
+    world.meta.bundle.description = opts.save_description.clone();
 
     // Copy bricks directly - they're already in brdb format
     world.bricks = data.bricks.clone();
@@ -59,7 +59,7 @@ pub fn write_brz_grids(
         world.meta.bundle.name = stem.to_string_lossy().to_string();
     }
     world.meta.bundle.authors = vec![opts.save_owner_name.clone()];
-    world.meta.bundle.description = "Converted with obj2brz (split by material)".to_string();
+    world.meta.bundle.description = opts.save_description.clone();
 
     // Add all bricks directly to world.bricks instead of using frozen grids
     // Frozen grids have rendering issues in Brickadia - bricks don't appear

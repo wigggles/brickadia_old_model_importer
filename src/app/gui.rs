@@ -58,6 +58,22 @@ pub fn bool_color(b: bool) -> Color32 {
     }
 }
 
+/// Creates a help button [?] that shows help text on hover and can be clicked to expand inline help.
+/// Returns true if the help section should be shown (expanded).
+pub fn help_button(ui: &mut Ui, _id: &str, help_text: &str, expanded: &mut bool) -> bool {
+    let button_text = if *expanded { "[-]" } else { "[?]" };
+    let response = ui.add(
+        Button::new(RichText::new(button_text).small().color(Color32::LIGHT_BLUE))
+            .frame(false)
+    ).on_hover_text(help_text);
+    
+    if response.clicked() {
+        *expanded = !*expanded;
+    }
+    
+    *expanded
+}
+
 pub fn footer(ctx: &Context) {
     TopBottomPanel::bottom("footer").show(ctx, |ui: &mut Ui| {
         ui.vertical_centered(|ui| {
